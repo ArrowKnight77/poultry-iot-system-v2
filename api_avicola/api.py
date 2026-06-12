@@ -1,10 +1,12 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 import os
+import re
 from datetime import datetime, timedelta
 import requests
 
@@ -270,47 +272,163 @@ def check_and_create_alerts():
     db.session.commit()
 
 # MQTT endpoint
+SENSOR_LIMITS = {
+    "temperatura": (-10.0, 60.0),
+    "humedad": (0.0, 100.0),
+    "co": (0.0, 1000.0),
+    "co2": (0.0, 10000.0),
+    "amoniaco": (0.0, 500.0),
+}
+
+REQUIRED_LECTURA_FIELDS = [
+    "id_lectura",
+    "modulo",
+    "hora",
+    "temperatura",
+    "humedad",
+    "co",
+    "co2",
+    "amoniaco",
+]
+
+
+def _parse_sensor_float(value, field_name, errors):
+    """Convertir valores de sensores a float y rechazar tipos inválidos."""
+    if isinstance(value, bool):
+        errors.append(f"'{field_name}' debe ser numérico, no booleano.")
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        errors.append(f"'{field_name}' debe ser un valor numérico.")
+        return None
+
+
+def _parse_iso_datetime(value, errors):
+    """Validar fecha/hora en formato ISO 8601."""
+    if not isinstance(value, str) or not value.strip():
+        errors.append("'hora' debe ser una fecha/hora en formato ISO 8601.")
+        return None
+
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        errors.append("'hora' debe tener formato ISO 8601 válido.")
+        return None
+
+
+def validate_lectura_payload(data):
+    """Validar y normalizar payload de lectura de sensores."""
+    errors = []
+
+    if not isinstance(data, dict):
+        return None, ["El cuerpo de la solicitud debe ser un objeto JSON."]
+
+    missing_fields = [field for field in REQUIRED_LECTURA_FIELDS if field not in data]
+    if missing_fields:
+        errors.append(f"Campos requeridos faltantes: {', '.join(missing_fields)}.")
+
+    id_lectura = data.get("id_lectura")
+    if not isinstance(id_lectura, str) or not id_lectura.strip():
+        errors.append("'id_lectura' debe ser texto no vacío.")
+    elif len(id_lectura.strip()) > 100:
+        errors.append("'id_lectura' no debe exceder 100 caracteres.")
+
+    modulo = data.get("modulo")
+    if not isinstance(modulo, str) or not modulo.strip():
+        errors.append("'modulo' debe ser texto no vacío.")
+    elif not re.match(r"^[A-Za-z0-9_-]{1,50}$", modulo.strip()):
+        errors.append("'modulo' solo puede contener letras, números, guion y guion bajo; máximo 50 caracteres.")
+
+    hora = _parse_iso_datetime(data.get("hora"), errors)
+
+    normalized = {
+        "id_lectura": id_lectura.strip() if isinstance(id_lectura, str) else id_lectura,
+        "modulo": modulo.strip() if isinstance(modulo, str) else modulo,
+        "hora": hora,
+    }
+
+    for field_name, (min_value, max_value) in SENSOR_LIMITS.items():
+        numeric_value = _parse_sensor_float(data.get(field_name), field_name, errors)
+
+        if numeric_value is not None:
+            if numeric_value < min_value or numeric_value > max_value:
+                errors.append(
+                    f"'{field_name}' fuera de rango permitido ({min_value} a {max_value})."
+                )
+
+        normalized[field_name] = numeric_value
+
+    if errors:
+        return None, errors
+
+    return normalized, []
+
+
 @app.route('/lecturas', methods=['POST'])
 @limiter.exempt
 def insert_lectura():
-    """Endpoint MQTT insertions"""
+    """Endpoint MQTT insertions with input validation."""
     try:
-        data = request.get_json()
-        print(f"MQTT INSERT: {data}")
+        data = request.get_json(silent=True)
 
-        # Convert string to datetime if necessary
-        hora_data = data['hora']
-        if isinstance(hora_data, str):
-            hora_data = datetime.fromisoformat(hora_data.replace('Z', '+00:00'))
+        if data is None:
+            return jsonify({
+                "error": "JSON inválido o ausente.",
+                "details": ["La solicitud debe incluir un cuerpo JSON válido."]
+            }), 400
+
+        validated_data, validation_errors = validate_lectura_payload(data)
+
+        if validation_errors:
+            return jsonify({
+                "error": "Validación fallida.",
+                "details": validation_errors
+            }), 422
+
+        print(f"MQTT INSERT VALIDATED: {validated_data}")
 
         nueva_lectura = Lectura(
-            id_lectura=data['id_lectura'],
-            modulo=data['modulo'],
-            hora=hora_data,
-            temperatura=data['temperatura'],
-            humedad=data['humedad'],
-            co=data['co'],
-            co2=data['co2'],
-            amoniaco=data['amoniaco']
+            id_lectura=validated_data['id_lectura'],
+            modulo=validated_data['modulo'],
+            hora=validated_data['hora'],
+            temperatura=validated_data['temperatura'],
+            humedad=validated_data['humedad'],
+            co=validated_data['co'],
+            co2=validated_data['co2'],
+            amoniaco=validated_data['amoniaco']
         )
 
         db.session.add(nueva_lectura)
         db.session.commit()
 
-        # Después de insertar una nueva lectura, evaluar umbrales y generar alertas
         try:
             check_and_create_alerts()
         except Exception as e:
-            # No romper la inserción de lecturas si falla la generación de alertas
             print(f"Error checking/creating alerts after MQTT insert: {e}")
 
-        print(f"MQTT VALUES INSERTED in DB: {data['id_lectura']}")
-        return jsonify({'msg': 'Record inserted successfully MQTT - DB'})
+        print(f"MQTT VALUES INSERTED in DB: {validated_data['id_lectura']}")
+
+        return jsonify({
+            "msg": "Record inserted successfully MQTT - DB",
+            "id_lectura": validated_data["id_lectura"]
+        }), 201
+
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({
+            "error": "Registro duplicado.",
+            "details": ["Ya existe una lectura con el mismo id_lectura."]
+        }), 409
 
     except Exception as e:
         print(f"Error Inserting MQTT VALUES: {e}")
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            "error": "Error interno al insertar lectura."
+        }), 500
+
 
 # ENDPINT to get the last record  
 @app.route('/lecturas', methods=['GET'])
