@@ -7,6 +7,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 import os
 import re
+import jwt
 import hmac
 from datetime import datetime, timedelta
 import requests
@@ -43,6 +44,12 @@ if not secret_key or len(secret_key) < 32:
 ingest_api_key = os.getenv("INGEST_API_KEY")
 if not ingest_api_key or len(ingest_api_key) < 32:
     raise RuntimeError("INGEST_API_KEY no definida o demasiado corta. Debe tener al menos 32 caracteres.")
+
+jwt_secret_key = os.getenv("JWT_SECRET_KEY")
+if not jwt_secret_key or len(jwt_secret_key) < 32:
+    raise RuntimeError("JWT_SECRET_KEY no definida o demasiado corta. Debe tener al menos 32 caracteres.")
+
+jwt_access_token_expires_minutes = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRES_MINUTES", "60"))
 
 app.config.update(
     SECRET_KEY=secret_key,
@@ -116,6 +123,50 @@ class User(db.Model):
         """Check if the provided password matches the hash"""
         return check_password_hash(self.password_hash, password)
 
+def serialize_user(user):
+    """Return safe user data for API responses."""
+    return {
+        "id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "role": user.role,
+        "initials": user.initials,
+        "profile_image_url": user.profile_image_url
+    }
+
+
+def generate_jwt_token(user):
+    """Generate signed JWT access token for authenticated API users."""
+    now = datetime.utcnow()
+    expires_at = now + timedelta(minutes=jwt_access_token_expires_minutes)
+
+    payload = {
+        "sub": str(user.id),
+        "username": user.username,
+        "role": user.role,
+        "iat": now,
+        "exp": expires_at,
+    }
+
+    return jwt.encode(payload, jwt_secret_key, algorithm="HS256")
+
+
+def decode_jwt_token(token):
+    """Decode and validate JWT access token."""
+    return jwt.decode(token, jwt_secret_key, algorithms=["HS256"])
+
+
+def get_bearer_token():
+    """Extract Bearer token from Authorization header."""
+    auth_header = request.headers.get("Authorization", "")
+
+    if not auth_header.startswith("Bearer "):
+        return None
+
+    return auth_header.split(" ", 1)[1].strip()
+
+
+        
 class Umbral(db.Model):
     __tablename__ = 'umbrales'
     id = db.Column(db.Integer, primary_key=True)
@@ -636,23 +687,66 @@ def register_user():
 @limiter.limit("10 per minute")  # Brute-force protection
 def login_user():
     try:
-        data = request.get_json()
-        user = User.query.filter_by(username=data['username']).first()
-        if user and user.check_password(data['password']):
+        data = request.get_json(silent=True)
+
+        if not isinstance(data, dict):
             return jsonify({
-                'msg': 'Login successful',
-                'user': {
-                    'id': user.id,
-                    'username': user.username,
-                    'full_name': user.full_name,
-                    'role': user.role,
-                    'initials': user.initials,
-                    'profile_image_url': user.profile_image_url
-                }
+                "error": "JSON inválido o ausente."
+            }), 400
+
+        username = data.get("username", "").strip()
+        password = data.get("password", "")
+
+        if not username or not password:
+            return jsonify({
+                "error": "Usuario y contraseña son requeridos."
+            }), 400
+
+        user = User.query.filter_by(username=username).first()
+
+        if user and user.check_password(password):
+            access_token = generate_jwt_token(user)
+
+            return jsonify({
+                "msg": "Login successful",
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": jwt_access_token_expires_minutes * 60,
+                "user": serialize_user(user)
             }), 200
-        return jsonify({'error': 'Invalid credentials'}), 401
+
+        return jsonify({"error": "Invalid credentials"}), 401
+
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"Error in login: {e}")
+        return jsonify({"error": "Error interno durante login."}), 500
+@app.route('/api/auth/verify', methods=['GET'])
+def verify_auth_token():
+    token = get_bearer_token()
+
+    if not token:
+        return jsonify({
+            "error": "Token requerido.",
+            "details": ["Usa el header Authorization: Bearer <token>."]
+        }), 401
+
+    try:
+        payload = decode_jwt_token(token)
+        user = User.query.get(int(payload["sub"]))
+
+        if not user:
+            return jsonify({"error": "Usuario no encontrado."}), 401
+
+        return jsonify({
+            "valid": True,
+            "user": serialize_user(user)
+        }), 200
+
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token expirado."}), 401
+
+    except jwt.InvalidTokenError:
+        return jsonify({"error": "Token inválido."}), 401
 
 @app.route('/api/user/<int:user_id>', methods=['GET', 'PUT'])
 def user_detail(user_id):

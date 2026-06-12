@@ -9,3 +9,4 @@ Werkzeug
 requests
 paho-mqtt==1.6.1
 Flask-Limiter
+PyJWT
