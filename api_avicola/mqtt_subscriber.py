@@ -6,11 +6,20 @@ import requests, json, uuid, time, os
 # environment variables
 API_URL = os.getenv('API_URL', 'http://localhost:5000/lecturas')
 MQTT_BROKER = os.getenv('MQTT_BROKER', 'localhost')
+API_INGEST_KEY = os.getenv('API_INGEST_KEY')
 MQTT_PORT = int(os.getenv('MQTT_PORT', '1883'))
 # Por defecto escuchamos todos los módulos y tanto esquema viejo como nuevo
 # - Esquema viejo: sensor/modulo1/temperatura, sensor/modulo1/humedad, etc.
 # - Esquema nuevo: sensor/modulo1/data (JSON con todos los valores)
 MQTT_TOPIC = os.getenv('MQTT_TOPIC', 'sensor/#')
+
+def build_api_headers():
+    headers = {"Content-Type": "application/json"}
+
+    if API_INGEST_KEY:
+        headers["X-Ingest-Key"] = API_INGEST_KEY
+
+    return headers
 
 
 current_readings = {}
@@ -61,7 +70,7 @@ def on_message(client, userdata, message):
                 print(f"[JSON] Recibido desde {topic}: {lectura_json}")
 
                 try:
-                    response = requests.post(API_URL, json=lectura_json, timeout=5)
+                    response = requests.post(API_URL,json=lectura_json,headers=build_api_headers(),timeout=5)
                     if response.status_code == 200:
                         print(f"✅ Lectura JSON ENVIADA a BD: {lectura_json['id_lectura']}")
                     else:
@@ -139,7 +148,7 @@ def on_message(client, userdata, message):
             
             # Enviar a la API via POST
             try:
-                response = requests.post(API_URL, json=reading, timeout=5)
+                response = requests.post(API_URL,json=lectura_json,headers=build_api_headers(),timeout=5)
                 if response.status_code == 200:
                     print(f"✅ Lectura ENVIADA EXITOSAMENTE a BD: {reading['id_lectura']}")
                     print(f"   📊 Datos: Temp={reading['temperatura']}°C, Hum={reading['humedad']}%, NH3={reading['amoniaco']}ppm, CO2={reading['co2']}ppm")

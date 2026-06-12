@@ -55,6 +55,7 @@ services:
       SECRET_KEY: ${SECRET_KEY}
       FLASK_ENV: ${FLASK_ENV}
       CORS_ORIGINS: ${CORS_ORIGINS}
+      INGEST_API_KEY: ${INGEST_API_KEY}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     restart: unless-stopped
@@ -75,7 +76,6 @@ services:
       API_BASE_URL: http://api:5000
       SECRET_KEY: ${SECRET_KEY}
       FLASK_ENV: ${FLASK_ENV}
-      
     restart: unless-stopped
 
   mqtt_subscriber:
@@ -96,6 +96,7 @@ services:
       MQTT_BROKER: mqtt
       MQTT_PORT: 1883
       MQTT_TOPIC: ${MQTT_TOPIC}
+      API_INGEST_KEY: ${INGEST_API_KEY}
     restart: unless-stopped
 
 volumes:

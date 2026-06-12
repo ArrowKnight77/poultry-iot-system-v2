@@ -7,6 +7,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 import os
 import re
+import hmac
 from datetime import datetime, timedelta
 import requests
 
@@ -38,6 +39,10 @@ environment = os.getenv("FLASK_ENV", "development").lower()
 secret_key = os.getenv("SECRET_KEY")
 if not secret_key or len(secret_key) < 32:
     raise RuntimeError("SECRET_KEY no definida o demasiado corta. Debe tener al menos 32 caracteres.")
+
+ingest_api_key = os.getenv("INGEST_API_KEY")
+if not ingest_api_key or len(ingest_api_key) < 32:
+    raise RuntimeError("INGEST_API_KEY no definida o demasiado corta. Debe tener al menos 32 caracteres.")
 
 app.config.update(
     SECRET_KEY=secret_key,
@@ -365,12 +370,26 @@ def validate_lectura_payload(data):
 
     return normalized, []
 
+def validate_ingest_key():
+    """Validate X-Ingest-Key header for sensor ingestion."""
+    expected_key = os.getenv("INGEST_API_KEY")
+    provided_key = request.headers.get("X-Ingest-Key", "")
+
+    if not expected_key or not provided_key:
+        return False
+
+    return hmac.compare_digest(provided_key, expected_key)
 
 @app.route('/lecturas', methods=['POST'])
 @limiter.exempt
 def insert_lectura():
     """Endpoint MQTT insertions with input validation."""
     try:
+        if not validate_ingest_key():
+            return jsonify({
+                "error": "No autorizado.",
+                "details": ["Se requiere una llave de ingestión válida."]
+            }), 401
         data = request.get_json(silent=True)
 
         if data is None:
