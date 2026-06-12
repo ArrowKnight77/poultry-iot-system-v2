@@ -1,0 +1,8 @@
+name: Poultry Local
+values:
+  - key: 'base_url '
+    value: ''
+  - key: 'allowed_origin '
+    value: ''
+  - key: 'ad_origin '
+    value: ''

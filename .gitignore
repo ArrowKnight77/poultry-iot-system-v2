@@ -55,3 +55,4 @@ local_tests/*
 
 # Claude Code session data
 .claude/
+.postman/
