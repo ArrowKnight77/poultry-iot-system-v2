@@ -28,8 +28,34 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 load_dotenv()
+
 app = Flask(__name__)
-CORS(app)
+
+environment = os.getenv("FLASK_ENV", "development").lower()
+
+secret_key = os.getenv("SECRET_KEY")
+if not secret_key or len(secret_key) < 32:
+    raise RuntimeError("SECRET_KEY no definida o demasiado corta. Debe tener al menos 32 caracteres.")
+
+app.config.update(
+    SECRET_KEY=secret_key,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=(environment == "production"),
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+)
+
+cors_origins_raw = os.getenv("CORS_ORIGINS", "http://localhost:5001")
+cors_origins = [origin.strip() for origin in cors_origins_raw.split(",") if origin.strip()]
+
+CORS(
+    app,
+    resources={
+        r"/api/*": {"origins": cors_origins},
+        r"/lecturas": {"origins": cors_origins},
+    },
+    supports_credentials=True
+)
 
 # Security: Rate Limiting
 # We set a generous global limit but strict limits on sensitive endpoints (login/register)
@@ -999,7 +1025,8 @@ def get_parvada(modulo_codigo):
 
 
 def start(port=5000, host='0.0.0.0'):
-    app.run(debug=True, port=port, host=host, use_reloader=False)
+    debug_mode = os.getenv("FLASK_ENV", "development").lower() == "development"
+    app.run(debug=debug_mode, port=port, host=host, use_reloader=False)
 
 if __name__ == '__main__':
     start()

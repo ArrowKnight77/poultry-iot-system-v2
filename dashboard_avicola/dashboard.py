@@ -38,7 +38,22 @@ def add_security_headers(response):
     return response
 
 db = SQLAlchemy(app)
-CORS(app)
+dashboard_cors_origins_raw = os.getenv(
+    "DASHBOARD_CORS_ORIGINS",
+    "http://localhost:5000,http://localhost:5001"
+)
+
+dashboard_cors_origins = [
+    origin.strip()
+    for origin in dashboard_cors_origins_raw.split(",")
+    if origin.strip()
+]
+
+CORS(
+    app,
+    origins=dashboard_cors_origins,
+    supports_credentials=True
+)
 
 login_manager = LoginManager()
 login_manager.login_view = 'login'
@@ -477,7 +492,8 @@ def reports():
 def start(port=5001, host='0.0.0.0'):
     if not os.path.exists('templates'):
         os.makedirs('templates')
-    app.run(debug=True, port=port, host=host, use_reloader=False)
+    debug_mode = os.getenv("FLASK_ENV", "development").lower() == "development"
+    app.run(debug=debug_mode, port=port, host=host, use_reloader=False)
 
 
 if __name__ == '__main__':
