@@ -5,6 +5,7 @@ from sqlalchemy.exc import IntegrityError
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
+from functools import wraps
 import os
 import re
 import jwt
@@ -165,7 +166,67 @@ def get_bearer_token():
 
     return auth_header.split(" ", 1)[1].strip()
 
+def get_current_user_from_token():
+    """Return authenticated user from Bearer token or an error response."""
+    token = get_bearer_token()
 
+    if not token:
+        return None, (jsonify({
+            "error": "Token requerido.",
+            "details": ["Usa el header Authorization: Bearer <token>."]
+        }), 401)
+
+    try:
+        payload = decode_jwt_token(token)
+        user = User.query.get(int(payload["sub"]))
+
+        if not user:
+            return None, (jsonify({
+                "error": "Usuario no encontrado."
+            }), 401)
+
+        return user, None
+
+    except jwt.ExpiredSignatureError:
+        return None, (jsonify({
+            "error": "Token expirado."
+        }), 401)
+
+    except jwt.InvalidTokenError:
+        return None, (jsonify({
+            "error": "Token inválido."
+        }), 401)
+
+
+def normalize_role(role):
+    """Normalize role names for RBAC checks."""
+    return (role or "").strip().lower()
+
+
+def auth_required(roles=None):
+    """Require valid JWT and optionally one of the allowed roles."""
+    allowed_roles = [normalize_role(role) for role in roles] if roles else None
+
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            current_user, error_response = get_current_user_from_token()
+
+            if error_response:
+                return error_response
+
+            if allowed_roles and normalize_role(current_user.role) not in allowed_roles:
+                return jsonify({
+                    "error": "Permisos insuficientes.",
+                    "details": ["El usuario autenticado no tiene rol autorizado para esta acción."]
+                }), 403
+
+            request.current_user = current_user
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
         
 class Umbral(db.Model):
     __tablename__ = 'umbrales'
@@ -749,6 +810,7 @@ def verify_auth_token():
         return jsonify({"error": "Token inválido."}), 401
 
 @app.route('/api/user/<int:user_id>', methods=['GET', 'PUT'])
+@auth_required()
 def user_detail(user_id):
     try:
         user = User.query.get(user_id)
@@ -766,6 +828,12 @@ def user_detail(user_id):
             })
         
         if request.method == 'PUT':
+            current_role = normalize_role(request.current_user.role)
+            if current_role != "admin":
+                return jsonify({
+                    "error": "Permisos insuficientes.",
+                    "details": ["Solo un administrador puede modificar usuarios."]
+                }), 403
             data = request.get_json()
             if 'full_name' in data: user.full_name = data['full_name']
             if 'role' in data: user.role = data['role']
@@ -796,6 +864,7 @@ def get_umbrales():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/umbrales', methods=['POST'])
+@auth_required(roles=["admin", "operador"])
 def update_umbrales():
     try:
         data = request.get_json()
@@ -834,6 +903,7 @@ def update_umbrales():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/umbrales/init', methods=['POST'])
+@auth_required(roles=["admin"])
 def init_umbrales():
     """Initialize default thresholds only if they don't exist"""
     try:
@@ -952,6 +1022,7 @@ def get_alerts():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/alerts/<int:alert_id>', methods=['PUT'])
+@auth_required(roles=["admin", "operador"])
 def update_alert(alert_id):
     """Update alert status"""
     try:
@@ -989,6 +1060,7 @@ def get_alert_stats():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/alerts/mark-all', methods=['PUT'])
+@auth_required(roles=["admin", "operador"])
 def mark_all_alerts():
     """Mark all active alerts as acknowledged"""
     try:
@@ -1003,6 +1075,7 @@ def mark_all_alerts():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/alerts/all', methods=['DELETE'])
+@auth_required(roles=["admin"])
 def delete_all_alerts():
     """Delete all alerts"""
     try:
@@ -1015,6 +1088,7 @@ def delete_all_alerts():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/alerts/check', methods=['POST'])
+@auth_required(roles=["admin", "operador"])
 def trigger_alert_check():
     """Manually trigger alert creation from existing data"""
     try:
@@ -1045,6 +1119,7 @@ def get_granjas():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/granjas', methods=['POST'])
+@auth_required(roles=["admin"])
 def create_granja():
     try:
         data = request.get_json()
@@ -1059,6 +1134,7 @@ def create_granja():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/granjas/<int:granja_id>', methods=['PUT'])
+@auth_required(roles=["admin"])
 def update_granja(granja_id):
     try:
         granja = Granja.query.get_or_404(granja_id)
@@ -1074,6 +1150,7 @@ def update_granja(granja_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/granjas/<int:granja_id>', methods=['DELETE'])
+@auth_required(roles=["admin"])
 def delete_granja(granja_id):
     try:
         granja = Granja.query.get_or_404(granja_id)
@@ -1115,6 +1192,7 @@ def get_naves():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/naves', methods=['POST'])
+@auth_required(roles=["admin"])
 def create_nave():
     try:
         data = request.get_json()
@@ -1137,6 +1215,7 @@ def create_nave():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/naves/<int:nave_id>', methods=['PUT'])
+@auth_required(roles=["admin"])
 def update_nave(nave_id):
     try:
         nave = Nave.query.get_or_404(nave_id)
@@ -1158,6 +1237,7 @@ def update_nave(nave_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/naves/<int:nave_id>', methods=['DELETE'])
+@auth_required(roles=["admin"])
 def delete_nave(nave_id):
     try:
         nave = Nave.query.get_or_404(nave_id)
@@ -1211,6 +1291,7 @@ def get_modulos():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/modulos/<string:codigo>', methods=['PUT'])
+@auth_required(roles=["admin", "operador"])
 def update_modulo(codigo):
     try:
         data = request.get_json()
