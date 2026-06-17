@@ -8,6 +8,8 @@ API_URL = os.getenv('API_URL', 'http://localhost:5000/lecturas')
 MQTT_BROKER = os.getenv('MQTT_BROKER', 'localhost')
 API_INGEST_KEY = os.getenv('API_INGEST_KEY')
 MQTT_PORT = int(os.getenv('MQTT_PORT', '1883'))
+MQTT_USERNAME = os.getenv('MQTT_USERNAME')
+MQTT_PASSWORD = os.getenv('MQTT_PASSWORD')
 # Por defecto escuchamos todos los módulos y tanto esquema viejo como nuevo
 # - Esquema viejo: sensor/modulo1/temperatura, sensor/modulo1/humedad, etc.
 # - Esquema nuevo: sensor/modulo1/data (JSON con todos los valores)
@@ -200,6 +202,9 @@ def start():
     
     try:
         client = mqtt.Client()
+        if MQTT_USERNAME and MQTT_PASSWORD:
+            client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
         client.on_connect = on_connect
         client.on_message = on_message
 

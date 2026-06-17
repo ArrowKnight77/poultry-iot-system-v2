@@ -56,3 +56,6 @@ local_tests/*
 # Claude Code session data
 .claude/
 .postman/
+
+# Local MQTT credentials
+mosquitto/config/passwd
