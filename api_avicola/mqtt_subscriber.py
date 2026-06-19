@@ -45,50 +45,62 @@ def on_message(client, userdata, message):
         # ---------------------------------------------
         try:
             data = json.loads(payload_text)
-            # Si se pudo parsear a dict, asumimos esquema JSON
+
             if isinstance(data, dict):
                 parts = topic.split("/")
                 if len(parts) < 3:
                     return
 
-                module_raw = parts[1]  # 'modulo1'
-                module_num = module_raw.replace('modulo', '')  # '1'
-                module_id = f'M{module_num}'  # Formato M1, M2, etc.
+                module_raw = parts[1].strip()
 
+                if module_raw.lower().startswith("modulo"):
+                    module_num = module_raw[6:]
+                elif module_raw.lower().startswith("m"):
+                    module_num = module_raw[1:]
+                else:
+                    module_num = module_raw
+
+                module_id = f"M{module_num}"
                 current_time = datetime.now()
 
                 lectura_json = {
-                    'id_lectura': str(uuid.uuid4()),
-                    'modulo': module_id,
-                    'hora': current_time.isoformat(),
-                    # Mapeamos las claves del firmware JSON a las columnas de la BD
-                    'temperatura': data.get('temp'),
-                    'humedad': data.get('hum'),
-                    'co': data.get('co'),
-                    'co2': data.get('co2'),
-                    'amoniaco': data.get('nh3')
+                    "id_lectura": data.get("id_lectura") or str(uuid.uuid4()),
+                    "modulo": data.get("modulo") or module_id,
+                    "hora": data.get("hora") or current_time.isoformat(),
+                    "temperatura": data.get("temp", data.get("temperatura")),
+                    "humedad": data.get("hum", data.get("humedad")),
+                    "co": data.get("co"),
+                    "co2": data.get("co2"),
+                    "amoniaco": data.get("nh3", data.get("amoniaco"))
                 }
 
                 print(f"[JSON] Recibido desde {topic}: {lectura_json}")
 
                 try:
-                    response = requests.post(API_URL,json=lectura_json,headers=build_api_headers(),timeout=5)
-                    if response.status_code == 200:
-                        print(f"✅ Lectura JSON ENVIADA a BD: {lectura_json['id_lectura']}")
-                    else:
-                        print(f"❌ Error API (HTTP {response.status_code}): {response.text}")
-                except requests.exceptions.ConnectionError:
-                    print("❌ ERROR: No se pudo conectar a la API en http://localhost:5000")
-                    print("   💡 Verifica que la API esté ejecutándose")
-                except requests.exceptions.Timeout:
-                    print("❌ ERROR: Timeout al conectar con la API")
-                except Exception as e:
-                    print(f"❌ ERROR enviando a API (JSON): {e}")
+                    response = requests.post(
+                        API_URL,
+                        json=lectura_json,
+                        headers=build_api_headers(),
+                        timeout=5
+                    )
 
-                # Para mensajes JSON no usamos el buffer ni cleanup
+                    if response.status_code in (200, 201):
+                        print(f"Lectura JSON enviada a BD: {lectura_json['id_lectura']}")
+                    else:
+                        print(f"Error API (HTTP {response.status_code}): {response.text}")
+
+                except requests.exceptions.ConnectionError:
+                    print("ERROR: No se pudo conectar a la API en http://localhost:5000")
+
+                except requests.exceptions.Timeout:
+                    print("ERROR: Timeout al conectar con la API")
+
+                except Exception as e:
+                    print(f"ERROR enviando a API (JSON): {e}")
+
                 return
+
         except json.JSONDecodeError:
-            # No es JSON, seguimos con el flujo antiguo
             pass
 
         # ---------------------------------------------
@@ -221,3 +233,4 @@ def stop():
 
 if __name__ == "__main__":
     start()
+
