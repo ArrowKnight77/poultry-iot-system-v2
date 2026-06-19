@@ -1,0 +1,7 @@
+# Publicador de sensores: solo puede escribir telemetría.
+user mqtt_sensor_user
+topic write sensor/+/data
+
+# Servicio interno: solo puede leer telemetría.
+user mqtt_subscriber_user
+topic read sensor/+/data
