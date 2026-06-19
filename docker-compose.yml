@@ -27,8 +27,10 @@ services:
       - avicola-network
     ports:
       - "127.0.0.1:1883:1883"
+      - "127.0.0.1:8883:8883"
     volumes:
       - ./mosquitto/config:/mosquitto/config:ro
+      - ./mosquitto/certs/broker:/mosquitto/certs/broker:ro
       - mosquitto_data:/mosquitto/data
     restart: unless-stopped
 
@@ -96,11 +98,15 @@ services:
     environment:
       API_URL: http://api:5000/lecturas
       MQTT_BROKER: mqtt
-      MQTT_PORT: 1883
+      MQTT_PORT: ${MQTT_PORT}
+      MQTT_TLS_ENABLED: ${MQTT_TLS_ENABLED:-true}
+      MQTT_TLS_CA_CERT: /mosquitto/certs/ca.crt
       MQTT_TOPIC: ${MQTT_TOPIC}
       API_INGEST_KEY: ${INGEST_API_KEY}
       MQTT_USERNAME: ${MQTT_SUBSCRIBER_USERNAME}
       MQTT_PASSWORD: ${MQTT_SUBSCRIBER_PASSWORD}
+    volumes:
+      - ./mosquitto/certs/broker/ca.crt:/mosquitto/certs/ca.crt:ro
     restart: unless-stopped
 
 volumes:

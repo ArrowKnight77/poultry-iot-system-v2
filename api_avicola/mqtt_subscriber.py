@@ -10,6 +10,8 @@ API_INGEST_KEY = os.getenv('API_INGEST_KEY')
 MQTT_PORT = int(os.getenv('MQTT_PORT', '1883'))
 MQTT_USERNAME = os.getenv('MQTT_USERNAME')
 MQTT_PASSWORD = os.getenv('MQTT_PASSWORD')
+MQTT_TLS_ENABLED = os.getenv("MQTT_TLS_ENABLED", "false").lower() == "true"
+MQTT_TLS_CA_CERT = os.getenv("MQTT_TLS_CA_CERT")
 # Por defecto escuchamos todos los módulos y tanto esquema viejo como nuevo
 # - Esquema viejo: sensor/modulo1/temperatura, sensor/modulo1/humedad, etc.
 # - Esquema nuevo: sensor/modulo1/data (JSON con todos los valores)
@@ -216,6 +218,14 @@ def start():
         client = mqtt.Client()
         if MQTT_USERNAME and MQTT_PASSWORD:
             client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        if MQTT_TLS_ENABLED:
+            if not MQTT_TLS_CA_CERT:
+                raise RuntimeError(
+                    "MQTT_TLS_CA_CERT no está definida para conexión MQTTS."
+                )
+
+            client.tls_set(ca_certs=MQTT_TLS_CA_CERT)
+            client.tls_insecure_set(False)
 
         client.on_connect = on_connect
         client.on_message = on_message
