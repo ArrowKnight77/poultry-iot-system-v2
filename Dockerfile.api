@@ -15,4 +15,4 @@ COPY api_avicola/ ./api_avicola/
 
 EXPOSE 5000
 
-CMD ["python", "run_api.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "60", "--access-logfile", "-", "--error-logfile", "-", "api_avicola.api:app"]

@@ -36,7 +36,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-environment = os.getenv("FLASK_ENV", "development").lower()
+environment = os.getenv("FLASK_ENV", "production").lower()
 
 secret_key = os.getenv("SECRET_KEY")
 if not secret_key or len(secret_key) < 32:
@@ -1337,7 +1337,7 @@ def get_parvada(modulo_codigo):
 
 
 def start(port=5000, host='0.0.0.0'):
-    debug_mode = os.getenv("FLASK_ENV", "development").lower() == "development"
+    debug_mode = os.getenv("FLASK_ENV", "production").lower() == "development"
     app.run(debug=debug_mode, port=port, host=host, use_reloader=False)
 
 if __name__ == '__main__':
