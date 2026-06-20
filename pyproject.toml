@@ -1,0 +1,17 @@
+[project]
+name = "poultry-iot-simulator"
+version = "0.1.0"
+description = "Simulador Raspberry Pi para MQTT seguro"
+authors = [
+    {name = "ArrowKnight77",email = "cdburnxp@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "paho-mqtt (>=2.0,<3.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

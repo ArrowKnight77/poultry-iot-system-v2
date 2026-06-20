@@ -1,5 +1,5 @@
 
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 import re
 import paho.mqtt.client as mqtt
@@ -29,12 +29,19 @@ SENSOR_LIMITS = {
 }
 
 
-def normalize_module_from_topic(topic):
-    """Obtener un módulo M<n> seguro desde sensor/<modulo>/data."""
+def normalize_module_from_topic(topic, expected_channel=None):
+    """Obtener un módulo M<n> seguro desde sensor/<modulo>/<canal>."""
     parts = topic.split("/")
 
-    if len(parts) != 3 or parts[0] != "sensor" or parts[2] != "data":
-        return None, "Tópico inválido. Se esperaba sensor/<modulo>/data."
+    if len(parts) != 3 or parts[0] != "sensor":
+        return None, "Tópico inválido. Se esperaba sensor/<modulo>/<canal>."
+
+    channel = parts[2]
+    if expected_channel and channel != expected_channel:
+        return None, (
+            f"Canal MQTT inválido. Se esperaba '{expected_channel}' "
+            f"y se recibió '{channel}'."
+        )
 
     module_raw = parts[1].strip()
     module_lower = module_raw.lower()
@@ -123,10 +130,102 @@ def build_api_headers():
 
 current_readings = {}
 last_reading_time = None
+node_states = {}
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def handle_node_status(topic, payload_text, retained):
+    module_id, topic_error = normalize_module_from_topic(topic, "status")
+
+    if topic_error:
+        print(f"[DROP] {topic_error} Topic: {topic}")
+        return
+
+    status = payload_text.strip().lower()
+    if status not in {"online", "offline"}:
+        print(
+            f"[DROP] Estado inválido en {topic}. "
+            "Solo se permite online u offline."
+        )
+        return
+
+    observed_at = utc_now_iso()
+    node = node_states.setdefault(module_id, {})
+    node.update({
+        "status": status,
+        "last_status": observed_at,
+        "last_seen": observed_at,
+    })
+
+    print(
+        f"[NODE] {module_id} status={status} "
+        f"retained={retained} observed_at={observed_at}"
+    )
+
+
+def handle_node_heartbeat(topic, payload_text):
+    module_id, topic_error = normalize_module_from_topic(topic, "heartbeat")
+
+    if topic_error:
+        print(f"[DROP] {topic_error} Topic: {topic}")
+        return
+
+    try:
+        heartbeat = json.loads(payload_text)
+    except json.JSONDecodeError:
+        print(f"[DROP] Heartbeat inválido en {topic}: JSON no válido.")
+        return
+
+    if not isinstance(heartbeat, dict):
+        print(f"[DROP] Heartbeat inválido en {topic}: se esperaba un objeto JSON.")
+        return
+
+    timestamp = heartbeat.get("timestamp")
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        print(f"[DROP] Heartbeat inválido en {topic}: timestamp requerido.")
+        return
+
+    try:
+        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        print(f"[DROP] Heartbeat inválido en {topic}: timestamp ISO 8601 inválido.")
+        return
+
+    uptime_seconds = heartbeat.get("uptime_seconds")
+    if uptime_seconds is not None:
+        if isinstance(uptime_seconds, bool):
+            print(f"[DROP] Heartbeat inválido en {topic}: uptime_seconds no puede ser booleano.")
+            return
+
+        try:
+            uptime_seconds = float(uptime_seconds)
+        except (TypeError, ValueError):
+            print(f"[DROP] Heartbeat inválido en {topic}: uptime_seconds debe ser numérico.")
+            return
+
+        if not math.isfinite(uptime_seconds) or uptime_seconds < 0:
+            print(f"[DROP] Heartbeat inválido en {topic}: uptime_seconds inválido.")
+            return
+
+    observed_at = utc_now_iso()
+    node = node_states.setdefault(module_id, {})
+    node.update({
+        "last_heartbeat": observed_at,
+        "last_seen": observed_at,
+    })
+
+    print(
+        f"[HEARTBEAT] {module_id} timestamp={timestamp} "
+        f"uptime_seconds={uptime_seconds} observed_at={observed_at}"
+    )
+
 def on_connect(client, userdata, flags, rc):
     print(f"Conected to MQTT broker: {rc}")
     if rc == 0:
-        client.subscribe(MQTT_TOPIC)
+        client.subscribe(MQTT_TOPIC, qos=1)
         print("Topic:  ", MQTT_TOPIC)
     else:
         print(f" Error de conexión MQTT: {rc}")
@@ -134,8 +233,14 @@ def on_connect(client, userdata, flags, rc):
 def on_message(client, userdata, message):
     try:
         topic = message.topic
-        payload_text = message.payload.decode()
+        payload_text = message.payload.decode(errors="replace")
+        if topic.endswith("/status"):
+            handle_node_status(topic, payload_text, message.retain)
+            return
 
+        if topic.endswith("/heartbeat"):
+            handle_node_heartbeat(topic, payload_text)
+            return
         # ---------------------------------------------
         # 1) Intentar interpretar como JSON (nuevo firmware)
         #    Topic esperado: sensor/moduloX/data
@@ -144,7 +249,7 @@ def on_message(client, userdata, message):
             data = json.loads(payload_text)
 
             if isinstance(data, dict):
-                module_id, topic_error = normalize_module_from_topic(topic)
+                module_id, topic_error = normalize_module_from_topic(topic, "data")
 
                 if topic_error:
                     print(f"[DROP] {topic_error} Topic: {topic}")

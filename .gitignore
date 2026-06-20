@@ -62,3 +62,4 @@ mosquitto/config/passwd
 
 # Local MQTT TLS material
 mosquitto/certs/
+.venv-simulator/
