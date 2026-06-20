@@ -105,6 +105,7 @@ services:
       API_INGEST_KEY: ${INGEST_API_KEY}
       MQTT_USERNAME: ${MQTT_SUBSCRIBER_USERNAME}
       MQTT_PASSWORD: ${MQTT_SUBSCRIBER_PASSWORD}
+      PYTHONUNBUFFERED: "1"
     volumes:
       - ./mosquitto/certs/broker/ca.crt:/mosquitto/certs/ca.crt:ro
     restart: unless-stopped

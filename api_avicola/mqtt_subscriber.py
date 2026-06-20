@@ -1,5 +1,7 @@
 
 from datetime import datetime
+import math
+import re
 import paho.mqtt.client as mqtt
 import requests, json, uuid, time, os
 
@@ -16,6 +18,99 @@ MQTT_TLS_CA_CERT = os.getenv("MQTT_TLS_CA_CERT")
 # - Esquema viejo: sensor/modulo1/temperatura, sensor/modulo1/humedad, etc.
 # - Esquema nuevo: sensor/modulo1/data (JSON con todos los valores)
 MQTT_TOPIC = os.getenv('MQTT_TOPIC', 'sensor/#')
+
+
+SENSOR_LIMITS = {
+    "temperatura": (-10.0, 60.0),
+    "humedad": (0.0, 100.0),
+    "co": (0.0, 1000.0),
+    "co2": (0.0, 10000.0),
+    "amoniaco": (0.0, 500.0),
+}
+
+
+def normalize_module_from_topic(topic):
+    """Obtener un módulo M<n> seguro desde sensor/<modulo>/data."""
+    parts = topic.split("/")
+
+    if len(parts) != 3 or parts[0] != "sensor" or parts[2] != "data":
+        return None, "Tópico inválido. Se esperaba sensor/<modulo>/data."
+
+    module_raw = parts[1].strip()
+    module_lower = module_raw.lower()
+
+    if module_lower.startswith("modulo"):
+        module_num = module_raw[6:]
+    elif module_lower.startswith("m"):
+        module_num = module_raw[1:]
+    else:
+        module_num = module_raw
+
+    if not module_num.isdigit() or int(module_num) < 1:
+        return None, "Módulo inválido en el tópico MQTT."
+
+    return f"M{int(module_num)}", None
+
+
+def validate_reading_before_forwarding(reading):
+    """Validar y normalizar telemetría antes de enviarla a la API."""
+    errors = []
+    normalized = {}
+
+    id_lectura = reading.get("id_lectura")
+    if not isinstance(id_lectura, str) or not id_lectura.strip():
+        errors.append("id_lectura debe ser texto no vacío.")
+    elif len(id_lectura.strip()) > 100:
+        errors.append("id_lectura no debe exceder 100 caracteres.")
+    else:
+        normalized["id_lectura"] = id_lectura.strip()
+
+    modulo = reading.get("modulo")
+    if not isinstance(modulo, str) or not re.fullmatch(r"M[1-9]\d*", modulo):
+        errors.append("modulo debe tener el formato M<n>, por ejemplo M1.")
+    else:
+        normalized["modulo"] = modulo
+
+    hora = reading.get("hora")
+    if not isinstance(hora, str) or not hora.strip():
+        errors.append("hora debe ser una fecha ISO 8601 no vacía.")
+    else:
+        try:
+            datetime.fromisoformat(hora.replace("Z", "+00:00"))
+            normalized["hora"] = hora
+        except ValueError:
+            errors.append("hora debe tener formato ISO 8601 válido.")
+
+    for field_name, (min_value, max_value) in SENSOR_LIMITS.items():
+        value = reading.get(field_name)
+
+        if isinstance(value, bool):
+            errors.append(f"{field_name} debe ser numérico, no booleano.")
+            continue
+
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            errors.append(f"{field_name} debe ser numérico.")
+            continue
+
+        if not math.isfinite(numeric_value):
+            errors.append(f"{field_name} debe ser un número finito.")
+            continue
+
+        if numeric_value < min_value or numeric_value > max_value:
+            errors.append(
+                f"{field_name} fuera de rango permitido "
+                f"({min_value} a {max_value})."
+            )
+            continue
+
+        normalized[field_name] = numeric_value
+
+    if errors:
+        return None, errors
+
+    return normalized, []
 
 def build_api_headers():
     headers = {"Content-Type": "application/json"}
@@ -49,25 +144,17 @@ def on_message(client, userdata, message):
             data = json.loads(payload_text)
 
             if isinstance(data, dict):
-                parts = topic.split("/")
-                if len(parts) < 3:
+                module_id, topic_error = normalize_module_from_topic(topic)
+
+                if topic_error:
+                    print(f"[DROP] {topic_error} Topic: {topic}")
                     return
 
-                module_raw = parts[1].strip()
-
-                if module_raw.lower().startswith("modulo"):
-                    module_num = module_raw[6:]
-                elif module_raw.lower().startswith("m"):
-                    module_num = module_raw[1:]
-                else:
-                    module_num = module_raw
-
-                module_id = f"M{module_num}"
                 current_time = datetime.now()
 
                 lectura_json = {
                     "id_lectura": data.get("id_lectura") or str(uuid.uuid4()),
-                    "modulo": data.get("modulo") or module_id,
+                    "modulo": module_id,
                     "hora": data.get("hora") or current_time.isoformat(),
                     "temperatura": data.get("temp", data.get("temperatura")),
                     "humedad": data.get("hum", data.get("humedad")),
@@ -76,20 +163,37 @@ def on_message(client, userdata, message):
                     "amoniaco": data.get("nh3", data.get("amoniaco"))
                 }
 
-                print(f"[JSON] Recibido desde {topic}: {lectura_json}")
+                validated_reading, validation_errors = (
+                    validate_reading_before_forwarding(lectura_json)
+                )
+
+                if validation_errors:
+                    print(
+                        f"[DROP] Payload rechazado en {topic}: "
+                        f"{'; '.join(validation_errors)}"
+                    )
+                    return
+
+                print(f"[JSON] Payload validado desde {topic}: {validated_reading}")
 
                 try:
                     response = requests.post(
                         API_URL,
-                        json=lectura_json,
+                        json=validated_reading,
                         headers=build_api_headers(),
                         timeout=5
                     )
 
                     if response.status_code in (200, 201):
-                        print(f"Lectura JSON enviada a BD: {lectura_json['id_lectura']}")
+                        print(
+                            "Lectura JSON enviada a BD: "
+                            f"{validated_reading['id_lectura']}"
+                        )
                     else:
-                        print(f"Error API (HTTP {response.status_code}): {response.text}")
+                        print(
+                            f"Error API (HTTP {response.status_code}): "
+                            f"{response.text}"
+                        )
 
                 except requests.exceptions.ConnectionError:
                     print("ERROR: No se pudo conectar a la API en http://localhost:5000")
@@ -138,50 +242,90 @@ def on_message(client, userdata, message):
                 'co': 0.0,
                 'co2': 0.0,
                 'amoniaco': 0.0,
-                'count': 0  # Contador de sensores recibidos
+                'received_sensors': set()  # Tipos de sensor recibidos
             }
 
         # Actualizar el valor correspondiente y aumentar contador
         reading = current_readings[reading_id]
         if sensor_type == 'temperatura':
             reading['temperatura'] = value
-            reading['count'] += 1
+            reading['received_sensors'].add(sensor_type)
         elif sensor_type == 'humedad':
             reading['humedad'] = value
-            reading['count'] += 1
+            reading['received_sensors'].add(sensor_type)
         elif sensor_type == 'co':
             reading['co'] = value
-            reading['count'] += 1
+            reading['received_sensors'].add(sensor_type)
         elif sensor_type == 'nh3':
             reading['amoniaco'] = value
-            reading['count'] += 1
+            reading['received_sensors'].add(sensor_type)
         elif sensor_type == 'co2':
             reading['co2'] = value
-            reading['count'] += 1
+            reading['received_sensors'].add(sensor_type)
 
-        if reading['count'] >= 5:
-            print(f"Sending to API: \n{reading}")
-            
-            # Enviar a la API via POST
+        if len(reading["received_sensors"]) == 5:
+            payload_to_validate = {
+                key: reading[key]
+                for key in (
+                    "id_lectura",
+                    "modulo",
+                    "hora",
+                    "temperatura",
+                    "humedad",
+                    "co",
+                    "co2",
+                    "amoniaco",
+                )
+            }
+
+            validated_reading, validation_errors = (
+                validate_reading_before_forwarding(payload_to_validate)
+            )
+
+            if validation_errors:
+                print(
+                    f"[DROP] Lectura antigua rechazada en {topic}: "
+                    f"{'; '.join(validation_errors)}"
+                )
+
+                if reading_id in current_readings:
+                    del current_readings[reading_id]
+
+                return
+
+            print(f"[LEGACY] Payload validado: {validated_reading}")
+
             try:
-                response = requests.post(API_URL,json=lectura_json,headers=build_api_headers(),timeout=5)
-                if response.status_code == 200:
-                    print(f"✅ Lectura ENVIADA EXITOSAMENTE a BD: {reading['id_lectura']}")
-                    print(f"   📊 Datos: Temp={reading['temperatura']}°C, Hum={reading['humedad']}%, NH3={reading['amoniaco']}ppm, CO2={reading['co2']}ppm")
-                    
-                    # ✅ LIMPIAR: Eliminar lectura procesada
+                response = requests.post(
+                    API_URL,
+                    json=validated_reading,
+                    headers=build_api_headers(),
+                    timeout=5
+                )
+
+                if response.status_code in (200, 201):
+                    print(
+                        "Lectura antigua enviada a BD: "
+                        f"{validated_reading['id_lectura']}"
+                    )
+
                     if reading_id in current_readings:
                         del current_readings[reading_id]
-                        print(f"🧹 Lectura {reading_id} eliminada del buffer")
+                        print(f"Lectura {reading_id} eliminada del buffer")
                 else:
-                    print(f"❌ Error API (HTTP {response.status_code}): {response.text}")
+                    print(
+                        f"Error API (HTTP {response.status_code}): "
+                        f"{response.text}"
+                    )
+
             except requests.exceptions.ConnectionError:
-                print("❌ ERROR: No se pudo conectar a la API en http://localhost:5000")
-                print("   💡 Verifica que la API esté ejecutándose")
+                print("ERROR: No se pudo conectar a la API en http://localhost:5000")
+
             except requests.exceptions.Timeout:
-                print("❌ ERROR: Timeout al conectar con la API")
+                print("ERROR: Timeout al conectar con la API")
+
             except Exception as e:
-                print(f"❌ ERROR enviando a API: {e}")
+                print(f"ERROR enviando a API: {e}")
 
         # ✅ MEJORADO: Limpiar lecturas antiguas (> 30 segundos)
         cleanup_old_readings()
