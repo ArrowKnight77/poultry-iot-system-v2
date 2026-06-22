@@ -105,6 +105,7 @@ class Lectura(db.Model):
     co = db.Column(db.Float)
     co2 = db.Column(db.Float)
     amoniaco = db.Column(db.Float)
+    oxigeno = db.Column(db.Float)
 
 class User(db.Model):
     __tablename__ = 'users'
@@ -313,7 +314,8 @@ def check_and_create_alerts():
             'humedad': 'Humedad',
             'co': 'CO',
             'co2': 'CO₂',
-            'amoniaco': 'Amoniaco'
+            'amoniaco': 'Amoniaco',
+            'oxigeno': 'Oxígeno',
         }
 
         # Check each parameter
@@ -322,7 +324,8 @@ def check_and_create_alerts():
             ('humedad', lectura.humedad, '%'),
             ('co', lectura.co, 'ppm'),
             ('co2', lectura.co2, 'ppm'),
-            ('amoniaco', lectura.amoniaco, 'ppm')
+            ('amoniaco', lectura.amoniaco, 'ppm'),
+            ('oxigeno', lectura.oxigeno, '% vol.'),
         ]
         
         for variable, valor, unidad in checks:
@@ -390,11 +393,12 @@ def check_and_create_alerts():
 
 # MQTT endpoint
 SENSOR_LIMITS = {
-    "temperatura": (-10.0, 60.0),
+    "temperatura": (-40.0, 125.0),
     "humedad": (0.0, 100.0),
-    "co": (0.0, 1000.0),
-    "co2": (0.0, 10000.0),
-    "amoniaco": (0.0, 500.0),
+    "co": (0.0, 500.0),
+    "co2": (400.0, 5000.0),
+    "amoniaco": (0.0, 100.0),
+    "oxigeno": (0.0, 25.0),
 }
 
 REQUIRED_LECTURA_FIELDS = [
@@ -406,6 +410,7 @@ REQUIRED_LECTURA_FIELDS = [
     "co",
     "co2",
     "amoniaco",
+    "oxigeno",
 ]
 
 
@@ -528,7 +533,8 @@ def insert_lectura():
             humedad=validated_data['humedad'],
             co=validated_data['co'],
             co2=validated_data['co2'],
-            amoniaco=validated_data['amoniaco']
+            amoniaco=validated_data['amoniaco'],
+            oxigeno=validated_data["oxigeno"],
         )
 
         db.session.add(nueva_lectura)
@@ -581,6 +587,7 @@ def get_lecturas():
             'co': lectura.co,
             'co2': lectura.co2,
             'amoniaco': lectura.amoniaco,
+            'oxigeno': lectura.oxigeno,
             'tvoc': 0,  # TVOC no está en la BD, valor por defecto
             'sync_time': datetime.now().isoformat()
         }]
@@ -611,6 +618,7 @@ def get_live_data():
             'co': lectura.co,
             'co2': lectura.co2,
             'amoniaco': lectura.amoniaco,
+            'oxigeno': lectura.oxigeno,
             'tvoc': 0,  # TVOC no está en la BD, valor por defecto
             'sync_time': datetime.now().isoformat()
         }
@@ -696,7 +704,8 @@ def historical_data():
                 "humidity": [],
                 "ammonia": [],
                 "co": [],
-                "co2": []
+                "co2": [],
+                "oxygen": [],
             })
         
         data = {
@@ -706,7 +715,8 @@ def historical_data():
             "humidity": [l.humedad for l in lecturas],
             "ammonia": [l.amoniaco for l in lecturas],
             "co": [l.co for l in lecturas],
-            "co2": [l.co2 for l in lecturas]
+            "co2": [l.co2 for l in lecturas],
+            "oxygen": [l.oxigeno for l in lecturas],
         }
         return jsonify(data)
     except Exception as e:

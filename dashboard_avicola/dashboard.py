@@ -301,6 +301,7 @@ def api_historical():
                 "ammonia": [],
                 "co": [],
                 "co2": [],
+                "oxygen": [],
                 "error": "No hay datos disponibles"
             })
             
@@ -314,6 +315,7 @@ def api_historical():
             "ammonia": [],
             "co": [],
             "co2": [],
+            "oxygen": [],
             "error": str(e)
         }), 500
 

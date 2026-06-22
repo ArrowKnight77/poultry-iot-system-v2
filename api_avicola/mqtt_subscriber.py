@@ -21,11 +21,12 @@ MQTT_TOPIC = os.getenv('MQTT_TOPIC', 'sensor/#')
 
 
 SENSOR_LIMITS = {
-    "temperatura": (-10.0, 60.0),
+    "temperatura": (-40.0, 125.0),
     "humedad": (0.0, 100.0),
-    "co": (0.0, 1000.0),
-    "co2": (0.0, 10000.0),
-    "amoniaco": (0.0, 500.0),
+    "co": (0.0, 500.0),
+    "co2": (400.0, 5000.0),
+    "amoniaco": (0.0, 100.0),
+    "oxigeno": (0.0, 25.0),
 }
 
 
@@ -265,7 +266,8 @@ def on_message(client, userdata, message):
                     "humedad": data.get("hum", data.get("humedad")),
                     "co": data.get("co"),
                     "co2": data.get("co2"),
-                    "amoniaco": data.get("nh3", data.get("amoniaco"))
+                    "amoniaco": data.get("nh3", data.get("amoniaco")),
+                    "oxigeno": data.get("o2", data.get("oxigeno")),
                 }
 
                 validated_reading, validation_errors = (
@@ -347,6 +349,7 @@ def on_message(client, userdata, message):
                 'co': 0.0,
                 'co2': 0.0,
                 'amoniaco': 0.0,
+                'oxigeno': None,
                 'received_sensors': set()  # Tipos de sensor recibidos
             }
 
@@ -367,8 +370,10 @@ def on_message(client, userdata, message):
         elif sensor_type == 'co2':
             reading['co2'] = value
             reading['received_sensors'].add(sensor_type)
-
-        if len(reading["received_sensors"]) == 5:
+        elif sensor_type == "o2":
+            reading["oxigeno"] = value
+            reading["received_sensors"].add(sensor_type)
+        if len(reading["received_sensors"]) == 6:
             payload_to_validate = {
                 key: reading[key]
                 for key in (
@@ -380,6 +385,7 @@ def on_message(client, userdata, message):
                     "co",
                     "co2",
                     "amoniaco",
+                    "oxigeno",
                 )
             }
 

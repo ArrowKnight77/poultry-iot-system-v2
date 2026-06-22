@@ -138,24 +138,28 @@
   <div class="col-6 col-md mb-3">
     <div class="card p-3">
       <h5 data-i18n="dashboard.card_ammonia">Amoniaco</h5>
-      <p id="ammonia_raw" class="value mb-0">-- ADC</p>
-      <small id="ammonia_ppm" class="text-muted fw-bold" style="font-size: 0.9rem;">-- ppm (calc)</small>
+      <p id="ammonia" class="value">-- ppm</p>
     </div>
   </div>
 
   <div class="col-6 col-md mb-3">
     <div class="card p-3">
       <h5 data-i18n="dashboard.card_co">CO</h5>
-      <p id="co_raw" class="value mb-0">-- ADC</p>
-      <small id="co_ppm" class="text-muted fw-bold" style="font-size: 0.9rem;">-- ppm (calc)</small>
+      <p id="co" class="value">-- ppm</p>
     </div>
   </div>
 
   <div class="col-6 col-md mb-3">
     <div class="card p-3">
       <h5 data-i18n="dashboard.card_co2">CO₂</h5>
-      <p id="co2" class="value mb-0">-- ppm</p>
-      <small id="co2_info" class="text-muted fw-bold" style="font-size: 0.9rem;"></small>
+      <p id="co2" class="value">-- ppm</p>
+    </div>
+  </div>
+
+  <div class="col-6 col-md mb-3">
+    <div class="card p-3">
+      <h5 data-i18n="dashboard.card_oxygen">Oxígeno</h5>
+      <p id="oxygen" class="value">-- % vol.</p>
     </div>
   </div>
 </div>
@@ -208,6 +212,12 @@
       <canvas id="co2Chart"></canvas>
     </div>
   </div>
+  <div class="col-md-6">
+    <div class="chart-container">
+      <h6 class="mb-3" data-i18n="dashboard.card_oxygen">Oxígeno</h6>
+      <canvas id="oxygenChart"></canvas>
+    </div>
+  </div>
 </div>
 
 <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
@@ -240,6 +250,10 @@
     if (window.co2Chart) {
       co2Chart.data.datasets[0].label = t('dashboard.chart_co2');
       co2Chart.update('none');
+    }
+    if (oxygenChart) {
+      oxygenChart.data.datasets[0].label = t('dashboard.chart_oxygen');
+      oxygenChart.update('none');
     }
     // Update connection badge text
     const badge = document.getElementById('connectionStatus');

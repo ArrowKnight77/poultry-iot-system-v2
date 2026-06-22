@@ -1,5 +1,5 @@
 // Dashboard JavaScript - (QUERÉTARO VERSION 1.0)
-let temperatureChart, humidityChart, ammoniaChart, coChart, co2Chart;
+let temperatureChart, humidityChart, ammoniaChart, coChart, co2Chart, oxygenChart;
 let lastRealUpdate = null;   // Timestamp de la última lectura del sensor (para mostrar en UI)
 let lastApiSuccess = null;   // Momento en que live-data respondió OK (para estado de conexión)
 
@@ -277,114 +277,27 @@ function calibrateWithOutsideAir(co2Reading, coReading, nh3Reading) {
 function updateMetricCards(data) {
   if (!data) return;
 
-  // 1. Procesar datos básicos
-  const tempVal = data.temperatura;
-  const humVal = data.humedad;
-  const nh3Raw = data.amoniaco;
-  const coRaw = data.co;
-  const co2Val = data.co2;
+  const setMetric = (elementId, value, decimals, unit) => {
+    const element = document.getElementById(elementId);
+    if (!element) return;
 
-  // 2. Procesar CCS811 con correcciones
-  const ccs811Data = processCCS811Data(co2Val, data.tvoc || 0, tempVal, humVal);
-
-  // 3. Calcular PPM para MQ (con fórmulas corregidas)
-  const nh3PPM = nh3Raw !== null ? calculatePPM(nh3Raw, 'NH3') : 0;
-  const coPPM = coRaw !== null ? calculatePPM(coRaw, 'CO') : 0;
-
-  // 4. Actualizar DOM con NUEVA ESTRUCTURA
-
-  // Temperatura (1 línea)
-  document.getElementById('temp').textContent =
-    (tempVal !== null && tempVal !== undefined) ? tempVal.toFixed(1) + ' °C' : '-- °C';
-
-  // Humedad (1 línea)
-  document.getElementById('hum').textContent =
-    (humVal !== null && humVal !== undefined) ? humVal.toFixed(1) + ' %' : '-- %';
-
-  // CO₂ (1 línea grande + info pequeña opcional)
-  const co2Element = document.getElementById('co2');
-  const co2InfoElement = document.getElementById('co2_info');
-
-  if (co2Val !== null) {
-    const corrected = ccs811Data.co2;
-    const original = Math.round(co2Val);
-
-    // Línea GRANDE: PPM corregido
-    co2Element.textContent = corrected + ' ppm';
-
-    // Línea PEQUEÑA: Info de corrección (solo si hay)
-    if (ccs811Data.isCorrected) {
-      const diff = Math.abs(original - corrected);
-
-      if (diff > 10 || CCS811_OFFSET !== 0) {
-        let infoText = `Original: ${original} ppm`;
-
-        co2InfoElement.textContent = infoText;
-        co2InfoElement.style.display = 'block';
-      } else {
-        co2InfoElement.textContent = '';
-        co2InfoElement.style.display = 'none';
-      }
-    } else {
-      co2InfoElement.textContent = '';
-      co2InfoElement.style.display = 'none';
+    if (value === null || value === undefined || value === "") {
+      element.textContent = `-- ${unit}`;
+      return;
     }
-  } else {
-    co2Element.textContent = '-- ppm';
-    co2InfoElement.textContent = '';
-    co2InfoElement.style.display = 'none';
-  }
 
-  // NH₃ - NUEVA ESTRUCTURA: RAW arriba, PPM abajo
-  const nh3RawElement = document.getElementById('ammonia_raw');
-  const nh3PPMElement = document.getElementById('ammonia_ppm');
+    const numericValue = Number(value);
+    element.textContent = Number.isFinite(numericValue)
+      ? `${numericValue.toFixed(decimals)} ${unit}`
+      : `-- ${unit}`;
+  };
 
-  if (nh3Raw !== null) {
-    // Línea GRANDE: Valor ADC (RAW)
-    nh3RawElement.textContent = nh3Raw.toFixed(0) + ' ADC';
-
-    // Línea PEQUEÑA: PPM calculado
-    if (nh3PPM > 0) {
-      nh3PPMElement.textContent = nh3PPM.toFixed(2) + ' ppm';
-      nh3PPMElement.style.display = 'block';
-    } else {
-      nh3PPMElement.textContent = 'Calculando...';
-      nh3PPMElement.style.display = 'block';
-    }
-  } else {
-    nh3RawElement.textContent = '-- ADC';
-    nh3PPMElement.textContent = '-- ppm';
-    nh3PPMElement.style.display = 'block';
-  }
-
-  // CO - NUEVA ESTRUCTURA: RAW arriba, PPM abajo
-  const coRawElement = document.getElementById('co_raw');
-  const coPPMElement = document.getElementById('co_ppm');
-
-  if (coRaw !== null) {
-    // Línea GRANDE: Valor ADC (RAW)
-    coRawElement.textContent = coRaw.toFixed(0) + ' ADC';
-
-    // Línea PEQUEÑA: PPM calculado
-    if (coPPM > 0) {
-      coPPMElement.textContent = coPPM.toFixed(2) + ' ppm';
-      coPPMElement.style.display = 'block';
-    } else {
-      coPPMElement.textContent = 'Calculando...';
-      coPPMElement.style.display = 'block';
-    }
-  } else {
-    coRawElement.textContent = '-- ADC';
-    coPPMElement.textContent = '-- ppm';
-    coPPMElement.style.display = 'block';
-  }
-
-  // Calibración automática en primera ejecución
-  if (!sessionStorage.getItem('auto_calibrated') && coRaw && nh3Raw) {
-    calibrateR0FromCleanAir(coRaw, nh3Raw);
-    sessionStorage.setItem('auto_calibrated', 'true');
-    console.log('Calibración automática de R0 completada');
-  }
+  setMetric("temp", data.temperatura, 1, "°C");
+  setMetric("hum", data.humedad, 1, "%");
+  setMetric("ammonia", data.amoniaco, 2, "ppm");
+  setMetric("co", data.co, 2, "ppm");
+  setMetric("co2", data.co2, 0, "ppm");
+  setMetric("oxygen", data.oxigeno, 2, "%");
 }
 
 // =========================================================
@@ -414,6 +327,7 @@ async function initializeDashboard() {
   ammoniaChart = initChart(document.getElementById('ammoniaChart'), t('dashboard.chart_nh3'), "#fb8c00");
   coChart = initChart(document.getElementById('coChart'), t('dashboard.chart_co'), "#43a047");
   co2Chart = initChart(document.getElementById('co2Chart'), t('dashboard.chart_co2'), "#e53935");
+  oxygenChart = initChart(document.getElementById('oxygenChart'), t('dashboard.chart_oxygen'), "#00897b");
 
   // Cargar datos iniciales
   loadHistorical("24h");
@@ -506,7 +420,7 @@ function initChart(ctx, label, color) {
 
 function clearAllCharts() {
   // Limpiar completamente todas las gráficas
-  const charts = [temperatureChart, humidityChart, ammoniaChart, coChart, co2Chart];
+  const charts = [temperatureChart, humidityChart, ammoniaChart, coChart, co2Chart, oxygenChart];
   
   charts.forEach(chart => {
     if (chart) {
@@ -793,12 +707,13 @@ async function loadHistorical(range, from = null, to = null, clearFirst = false)
   }
 
   // Actualizar gráficas con datos del módulo seleccionado
-  if (temperatureChart && humidityChart && ammoniaChart && coChart && co2Chart) {
+  if (temperatureChart && humidityChart && ammoniaChart && coChart && co2Chart && oxygenChart) {
     updateChart(temperatureChart, data.timestamps, data.temperature);
     updateChart(humidityChart, data.timestamps, data.humidity);
     updateChart(ammoniaChart, data.timestamps, data.ammonia);
     updateChart(coChart, data.timestamps, data.co);
     updateChart(co2Chart, data.timestamps, data.co2);
+    updateChart(oxygenChart, data.timestamps, data.oxygen);
   }
 
   setTimeout(() => {
@@ -998,11 +913,11 @@ window.adjustEmpiricalFactors = (mq7Factor, mq137Factor) => {
 
 // Configuración de rangos para sliders de umbrales
 const THRESHOLD_SLIDER_CONFIG = {
-  temperatura: { min: 0, max: 100, step: 0.5 },     // °C (0-100)
-  humedad: { min: 0, max: 100, step: 1 },           // %  (0-100)
-  co: { min: 0, max: 10000, step: 10 },             // ppm CO (0-10,000)
-  co2: { min: 0, max: 10000, step: 10 },            // ppm CO2 (0-10,000)
-  amoniaco: { min: 0, max: 10000, step: 10 }        // ppm NH3 (0-10,000)
+  temperatura: { min: -40, max: 125, step: 0.5 },
+  humedad: { min: 0, max: 100, step: 1 },
+  co: { min: 0, max: 500, step: 1 },
+  co2: { min: 400, max: 5000, step: 10 },
+  amoniaco: { min: 0, max: 100, step: 1 }
 };
 
 function getThresholdSliderConfig(variable) {
