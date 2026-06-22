@@ -223,11 +223,31 @@
 <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
 
 <script>
-  document.addEventListener('DOMContentLoaded', function () {
-    initializeDashboard();
-    // Refresh live data every 5 seconds
-    setInterval(updateLiveData, 5000);
-  });
+document.addEventListener('DOMContentLoaded', function () {
+  initializeDashboard();
+
+  // Tarjetas en vivo
+  setInterval(updateLiveData, 5000);
+
+  // Histórico y gráficas
+  setInterval(() => {
+    const rangeSelect = document.getElementById('rangeSelect');
+    if (!rangeSelect) return;
+
+    const range = rangeSelect.value;
+
+    if (range === 'custom') {
+      const from = document.getElementById('fromDate').value;
+      const to = document.getElementById('toDate').value;
+
+      if (from && to) {
+        loadHistorical('custom', from, to);
+      }
+    } else {
+      loadHistorical(range);
+    }
+  }, 15000);
+});
 
   // Re-init charts labels when language changes
   document.addEventListener('langchange', function () {

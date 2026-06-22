@@ -465,27 +465,44 @@ function getRangeFromUI() {
 function updateChart(chart, labels, data) {
   if (!chart) return;
 
-  const dataPoints = (labels || []).map((ts, index) => ({
-    x: parseTimestamp(ts),
-    y: (data || [])[index] !== null ? (data || [])[index] : null
-  })).filter(point => point.y !== null);
+  const safeLabels = [];
+  const safeValues = [];
 
-  if (chart.options.scales && chart.options.scales.x) {
-    const range = getRangeFromUI();
-    if (range) {
-      chart.options.scales.x.min = range.min;
-      chart.options.scales.x.max = range.max;
-    } else if (dataPoints.length > 0) {
-      const minTime = Math.min(...dataPoints.map(p => p.x.getTime()));
-      const maxTime = Math.max(...dataPoints.map(p => p.x.getTime()));
-      const margin = (maxTime - minTime) * 0.05 || 1000;
-      chart.options.scales.x.min = new Date(minTime - margin);
-      chart.options.scales.x.max = new Date(maxTime + margin);
+  (labels || []).forEach((timestamp, index) => {
+    const rawValue = (data || [])[index];
+
+    if (
+      rawValue === null ||
+      rawValue === undefined ||
+      rawValue === ""
+    ) {
+      return;
     }
-  }
 
-  chart.data.datasets[0].data = dataPoints;
-  chart.update('none');
+    const value = Number(rawValue);
+    const date = parseTimestamp(timestamp);
+
+    if (!Number.isFinite(value) || Number.isNaN(date.getTime())) {
+      return;
+    }
+
+    safeLabels.push(
+      date.toLocaleTimeString("es-MX", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+    );
+    safeValues.push(value);
+  });
+
+  chart.options.scales.x.type = "category";
+  chart.options.scales.x.min = undefined;
+  chart.options.scales.x.max = undefined;
+
+  chart.data.labels = safeLabels;
+  chart.data.datasets[0].data = safeValues;
+  chart.update("none");
 }
 
 // =========================================================
@@ -642,14 +659,14 @@ function getBaseUrl() {
 }
 
 async function fetchHistoricalData(range, from = null, to = null) {
-  let url = `${getBaseUrl()}/api/historical?range=${range}`;
+  let url = `/api/historical?range=${encodeURIComponent(range)}`;
   if (from && to) url += `&from=${from}&to=${to}`;
 
   // Add module parameter
   const moduleSelect = document.getElementById('moduleSelect');
   if (moduleSelect) {
     const module = moduleSelect.value;
-    url += `&modulo=${module}`;
+    url += `&house=${encodeURIComponent(module)}`;
     console.log(`Fetching data for range: ${range}, module: ${module}`);
   }
 
@@ -692,72 +709,50 @@ function formatTimeAgo(date) {
 }
 
 async function loadHistorical(range, from = null, to = null, clearFirst = false) {
-  const historicalStatus = document.getElementById('historicalStatus') || createHistoricalStatus();
-  historicalStatus.textContent = 'Cargando...';
-  historicalStatus.className = 'badge bg-info';
+  const historicalStatus =
+    document.getElementById("historicalStatus") || createHistoricalStatus();
 
-  // Solo limpiar cuando el usuario cambia de rango o módulo (no en cada actualización periódica)
+  historicalStatus.style.display = "none";
+
   if (clearFirst) clearAllCharts();
 
   const data = await fetchHistoricalData(range, from, to);
+
   if (!data || !data.timestamps || data.timestamps.length === 0) {
-    historicalStatus.textContent = 'Sin datos';
-    historicalStatus.className = 'badge bg-warning';
+    historicalStatus.textContent = "Sin datos históricos";
+    historicalStatus.className = "badge bg-warning";
+    historicalStatus.style.display = "";
     return;
   }
 
-  // Actualizar gráficas con datos del módulo seleccionado
-  if (temperatureChart && humidityChart && ammoniaChart && coChart && co2Chart && oxygenChart) {
+  const chartsReady =
+    temperatureChart &&
+    humidityChart &&
+    ammoniaChart &&
+    coChart &&
+    co2Chart &&
+    oxygenChart;
+
+  if (!chartsReady) {
+    historicalStatus.textContent = "Gráficas no inicializadas";
+    historicalStatus.className = "badge bg-warning";
+    historicalStatus.style.display = "";
+    return;
+  }
+
+  try {
     updateChart(temperatureChart, data.timestamps, data.temperature);
     updateChart(humidityChart, data.timestamps, data.humidity);
     updateChart(ammoniaChart, data.timestamps, data.ammonia);
     updateChart(coChart, data.timestamps, data.co);
     updateChart(co2Chart, data.timestamps, data.co2);
     updateChart(oxygenChart, data.timestamps, data.oxygen);
+  } catch (error) {
+    historicalStatus.textContent = `Error al graficar: ${error.message}`;
+    historicalStatus.className = "badge bg-danger";
+    historicalStatus.style.display = "";
+    console.error("Error de gráficas:", error);
   }
-
-  setTimeout(() => {
-    historicalStatus.textContent = 'Gráficas actualizadas';
-    historicalStatus.className = 'badge bg-success';
-    setTimeout(() => historicalStatus.style.display = 'none', 2000);
-  }, 1000);
-}
-
-// New function to fetch data for all modules
-async function fetchAllModulesData(range, from = null, to = null) {
-  const modules = ['M1', 'M2', 'M3', 'M4', 'M5'];
-  const allData = {};
-  
-  for (const module of modules) {
-    let url = `${getBaseUrl()}/api/historical?range=${range}&modulo=${module}`;
-    if (from && to) url += `&from=${from}&to=${to}`;
-    
-    try {
-      const res = await fetch(url);
-      if (res.ok) {
-        const data = await res.json();
-        if (data && data.timestamps && data.timestamps.length > 0) {
-          allData[module] = data;
-        }
-      }
-    } catch (err) {
-      console.error(`Error fetching data for module ${module}:`, err);
-    }
-  }
-  
-  return allData;
-}
-
-function applyCustomRange() {
-  const from = document.getElementById('fromDate').value;
-  const to = document.getElementById('toDate').value;
-
-  if (!from || !to) {
-    alert('Por favor selecciona ambas fechas (desde y hasta)');
-    return;
-  }
-
-  loadHistorical("custom", from, to, true);
 }
 
 // =========================================================
