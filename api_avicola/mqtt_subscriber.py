@@ -11,6 +11,11 @@ import sys
 API_URL = os.getenv('API_URL', 'http://localhost:5000/lecturas')
 MQTT_BROKER = os.getenv('MQTT_BROKER', 'localhost')
 API_INGEST_KEY = os.getenv('API_INGEST_KEY')
+SECURITY_EVENTS_API_URL = os.getenv(
+    'SECURITY_EVENTS_API_URL',
+    'http://localhost:5000/api/security-events/ingest',
+)
+SECURITY_EVENTS_API_KEY = os.getenv('SECURITY_EVENTS_API_KEY')
 MQTT_PORT = int(os.getenv('MQTT_PORT', '1883'))
 MQTT_USERNAME = os.getenv('MQTT_USERNAME')
 MQTT_PASSWORD = os.getenv('MQTT_PASSWORD')
@@ -171,6 +176,86 @@ def build_api_headers():
     return headers
 
 
+def build_security_events_headers():
+    return {
+        "Content-Type": "application/json",
+        "X-Security-Events-Key": SECURITY_EVENTS_API_KEY or "",
+    }
+
+
+def report_security_event(
+    event_type,
+    reason,
+    module_id=None,
+    topic=None,
+    severity="warning",
+):
+    """Enviar un evento técnico a la API sin interrumpir telemetría."""
+
+    if not SECURITY_EVENTS_API_URL or not SECURITY_EVENTS_API_KEY:
+        logger.error(
+            "event=security_event_report_failed reason=missing_configuration "
+            "security_event_type=%s",
+            safe_log_value(event_type, limit=100),
+        )
+        return False
+
+    event_payload = {
+        "event_type": safe_log_value(event_type, limit=100),
+        "severity": safe_log_value(severity, limit=20).lower(),
+        "module": safe_log_value(module_id, limit=50) if module_id else None,
+        "reason": safe_log_value(reason, limit=100),
+        "topic": safe_log_value(topic, limit=150) if topic else None,
+    }
+
+    try:
+        response = requests.post(
+            SECURITY_EVENTS_API_URL,
+            json=event_payload,
+            headers=build_security_events_headers(),
+            timeout=3,
+        )
+
+        if response.status_code == 201:
+            logger.debug(
+                "event=security_event_reported security_event_type=%s",
+                event_payload["event_type"],
+            )
+            return True
+
+        logger.warning(
+            "event=security_event_report_failed reason=api_http_error "
+            "security_event_type=%s http_status=%s",
+            event_payload["event_type"],
+            response.status_code,
+        )
+        return False
+
+    except requests.exceptions.ConnectionError:
+        logger.warning(
+            "event=security_event_report_failed reason=api_connection "
+            "security_event_type=%s",
+            event_payload["event_type"],
+        )
+        return False
+
+    except requests.exceptions.Timeout:
+        logger.warning(
+            "event=security_event_report_failed reason=api_timeout "
+            "security_event_type=%s",
+            event_payload["event_type"],
+        )
+        return False
+
+    except Exception:
+        logger.exception(
+            "event=security_event_report_failed reason=unexpected_error "
+            "security_event_type=%s",
+            event_payload["event_type"],
+        )
+        return False
+
+
 current_readings = {}
 last_reading_time = None
 node_states = {}
@@ -187,6 +272,13 @@ def log_mqtt_rejection(event, reason, topic, module_id=None):
         safe_log_value(reason, limit=80),
         safe_log_value(module_id, limit=32),
         safe_log_value(topic, limit=150),
+    )
+    report_security_event(
+        event_type=event,
+        reason=reason,
+        module_id=module_id,
+        topic=topic,
+        severity="warning",
     )
 
 
@@ -391,6 +483,13 @@ def on_message(client, userdata, message):
                         len(validation_errors),
                         safe_log_value(topic, limit=150),
                     )
+                    report_security_event(
+                        event_type="telemetry_rejected",
+                        reason="validation_failed",
+                        module_id=module_id,
+                        topic=topic,
+                        severity="warning",
+                    )
                     return
 
                 logger.info(
@@ -548,6 +647,13 @@ def on_message(client, userdata, message):
                     safe_log_value(reading.get("id_lectura")),
                     len(validation_errors),
                     safe_log_value(topic, limit=150),
+                )
+                report_security_event(
+                    event_type="telemetry_rejected",
+                    reason="validation_failed",
+                    module_id=reading.get("modulo"),
+                    topic=topic,
+                    severity="warning",
                 )
 
                 if reading_id in current_readings:

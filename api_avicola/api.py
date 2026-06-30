@@ -98,6 +98,13 @@ ingest_api_key = os.getenv("INGEST_API_KEY")
 if not ingest_api_key or len(ingest_api_key) < 32:
     raise RuntimeError("INGEST_API_KEY no definida o demasiado corta. Debe tener al menos 32 caracteres.")
 
+security_events_api_key = os.getenv("SECURITY_EVENTS_API_KEY")
+if not security_events_api_key or len(security_events_api_key) < 32:
+    raise RuntimeError(
+        "SECURITY_EVENTS_API_KEY no definida o demasiado corta. "
+        "Debe tener al menos 32 caracteres."
+    )
+
 jwt_secret_key = os.getenv("JWT_SECRET_KEY")
 if not jwt_secret_key or len(jwt_secret_key) < 32:
     raise RuntimeError("JWT_SECRET_KEY no definida o demasiado corta. Debe tener al menos 32 caracteres.")
@@ -302,6 +309,136 @@ class Alerta(db.Model):
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     timestamp_resuelto = db.Column(db.DateTime)
     sensor = db.Column(db.String(100))
+
+class SecurityEvent(db.Model):
+    """Evento de seguridad persistente y consultable."""
+
+    __tablename__ = "security_events"
+
+    id = db.Column(db.Integer, primary_key=True)
+    event_type = db.Column(db.String(100), nullable=False, index=True)
+    severity = db.Column(db.String(20), nullable=False, default="warning")
+    source = db.Column(db.String(50), nullable=False, index=True)
+    module = db.Column(db.String(50), index=True)
+    source_ip = db.Column(db.String(64))
+    actor_username = db.Column(db.String(80))
+    details = db.Column(db.JSON, nullable=False, default=dict)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+SECURITY_EVENT_SEVERITIES = {"info", "warning", "error", "critical"}
+SENSITIVE_EVENT_DETAIL_MARKERS = (
+    "password",
+    "token",
+    "secret",
+    "key",
+    "authorization",
+    "credential",
+    "certificate",
+    "payload",
+)
+
+
+def sanitize_security_event_details(details):
+    """Conservar solo metadatos seguros y legibles para auditoría."""
+
+    sanitized = {}
+
+    for raw_key, raw_value in details.items():
+        key = safe_log_value(raw_key, limit=64).lower()
+
+        if any(marker in key for marker in SENSITIVE_EVENT_DETAIL_MARKERS):
+            continue
+
+        sanitized[key] = safe_log_value(raw_value, limit=160)
+
+    return sanitized
+
+
+def record_security_event(
+    event_type,
+    severity="warning",
+    source="api",
+    module=None,
+    source_ip=None,
+    actor_username=None,
+    **details,
+):
+    """Guardar un evento sin alterar la respuesta principal del flujo."""
+
+    normalized_severity = safe_log_value(severity, limit=20).lower()
+    if normalized_severity not in SECURITY_EVENT_SEVERITIES:
+        normalized_severity = "warning"
+
+    try:
+        security_event = SecurityEvent(
+            event_type=safe_log_value(event_type, limit=100),
+            severity=normalized_severity,
+            source=safe_log_value(source, limit=50),
+            module=safe_log_value(module, limit=50) if module else None,
+            source_ip=safe_log_value(source_ip, limit=64) if source_ip else None,
+            actor_username=(
+                safe_log_value(actor_username, limit=80)
+                if actor_username
+                else None
+            ),
+            details=sanitize_security_event_details(details),
+        )
+
+        db.session.add(security_event)
+        db.session.commit()
+
+        logger.info(
+            "event=security_event_persisted security_event_type=%s "
+            "severity=%s source=%s security_event_id=%s",
+            security_event.event_type,
+            security_event.severity,
+            security_event.source,
+            security_event.id,
+        )
+
+        return security_event
+
+    except Exception:
+        db.session.rollback()
+        logger.exception(
+            "event=security_event_persist_failed security_event_type=%s source=%s",
+            safe_log_value(event_type, limit=100),
+            safe_log_value(source, limit=50),
+        )
+        return None
+
+
+def validate_security_events_key():
+    """Validar la llave técnica usada por servicios internos."""
+
+    provided_key = request.headers.get("X-Security-Events-Key", "")
+
+    if not security_events_api_key or not provided_key:
+        return False
+
+    return hmac.compare_digest(provided_key, security_events_api_key)
+
+
+def serialize_security_event(security_event):
+    """Convertir un evento persistido a una respuesta segura de API."""
+
+    return {
+        "id": security_event.id,
+        "event_type": security_event.event_type,
+        "severity": security_event.severity,
+        "source": security_event.source,
+        "module": security_event.module,
+        "source_ip": security_event.source_ip,
+        "actor_username": security_event.actor_username,
+        "details": security_event.details or {},
+        "created_at": (
+            security_event.created_at.isoformat()
+            if security_event.created_at
+            else None
+        ),
+    }
+
 
 class Granja(db.Model):
     __tablename__ = 'granjas'
@@ -564,6 +701,13 @@ def insert_lectura():
                 "event=telemetry_ingest_unauthorized source_ip=%s",
                 request_source_ip(),
             )
+            record_security_event(
+                event_type="telemetry_ingest_unauthorized",
+                severity="warning",
+                source="api",
+                source_ip=request_source_ip(),
+                reason="invalid_or_missing_ingest_key",
+            )
             return jsonify({
                 "error": "No autorizado.",
                 "details": ["Se requiere una llave de ingestión válida."]
@@ -574,6 +718,13 @@ def insert_lectura():
             logger.warning(
                 "event=telemetry_rejected reason=json_missing source_ip=%s",
                 request_source_ip(),
+            )
+            record_security_event(
+                event_type="telemetry_rejected",
+                severity="warning",
+                source="api",
+                source_ip=request_source_ip(),
+                reason="json_missing",
             )
             return jsonify({
                 "error": "JSON inválido o ausente.",
@@ -590,6 +741,15 @@ def insert_lectura():
                 safe_log_value(raw_module, limit=32),
                 len(validation_errors),
                 request_source_ip(),
+            )
+            record_security_event(
+                event_type="telemetry_rejected",
+                severity="warning",
+                source="api",
+                module=raw_module,
+                source_ip=request_source_ip(),
+                reason="validation_failed",
+                error_count=len(validation_errors),
             )
             return jsonify({
                 "error": "Validación fallida.",
@@ -912,6 +1072,14 @@ def login_user():
             "event=login_failed username=%s source_ip=%s",
             safe_log_value(username, limit=64),
             request_source_ip(),
+        )
+        record_security_event(
+            event_type="login_failed",
+            severity="warning",
+            source="api",
+            source_ip=request_source_ip(),
+            actor_username=username,
+            reason="invalid_credentials",
         )
         return jsonify({"error": "Invalid credentials"}), 401
 
@@ -1279,6 +1447,102 @@ def trigger_alert_check():
         request_source_ip(),
         )
         return jsonify({'error': str(e)}), 500
+
+# -------------------------------------------------------
+# Eventos de seguridad
+# -------------------------------------------------------
+@app.route("/api/security-events", methods=["GET"])
+@auth_required(roles=["admin", "operador"])
+def get_security_events():
+    """Consultar eventos persistentes para análisis operativo."""
+
+    severity = request.args.get("severity", "all").strip().lower()
+    source = request.args.get("source", "all").strip().lower()
+    module = request.args.get("module", "all").strip()
+    limit = request.args.get("limit", 100, type=int)
+    limit = max(1, min(limit, 200))
+
+    query = SecurityEvent.query
+
+    if severity != "all":
+        query = query.filter(SecurityEvent.severity == severity)
+
+    if source != "all":
+        query = query.filter(SecurityEvent.source == source)
+
+    if module != "all":
+        query = query.filter(SecurityEvent.module == module)
+
+    events = query.order_by(SecurityEvent.created_at.desc()).limit(limit).all()
+
+    return jsonify({
+        "count": len(events),
+        "events": [
+            serialize_security_event(event)
+            for event in events
+        ],
+    }), 200
+
+
+@app.route("/api/security-events/ingest", methods=["POST"])
+def ingest_security_event():
+    """Recibir eventos técnicos desde mqtt_subscriber con llave propia."""
+
+    if not validate_security_events_key():
+        logger.warning(
+            "event=security_events_ingest_unauthorized source_ip=%s",
+            request_source_ip(),
+        )
+        return jsonify({"error": "No autorizado."}), 401
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON inválido o ausente."}), 400
+
+    event_type = data.get("event_type", "")
+    severity = data.get("severity", "warning")
+    module = data.get("module")
+    reason = data.get("reason")
+    topic = data.get("topic")
+
+    if not isinstance(event_type, str) or not re.fullmatch(
+        r"[a-z][a-z0-9_]{2,99}",
+        event_type,
+    ):
+        return jsonify({"error": "event_type inválido."}), 422
+
+    normalized_severity = safe_log_value(severity, limit=20).lower()
+
+    if normalized_severity not in SECURITY_EVENT_SEVERITIES:
+        return jsonify({"error": "severity inválida."}), 422
+
+    if module is not None and (
+        not isinstance(module, str)
+        or not re.fullmatch(r"[A-Za-z0-9_-]{1,50}", module)
+    ):
+        return jsonify({"error": "module inválido."}), 422
+
+    security_event = record_security_event(
+        event_type=event_type,
+        severity=normalized_severity,
+        source="mqtt_subscriber",
+        module=module,
+        source_ip=request_source_ip(),
+        reason=reason,
+        topic=topic,
+    )
+
+    if not security_event:
+        return jsonify({
+            "error": "No fue posible guardar el evento."
+        }), 500
+
+    return jsonify({
+        "msg": "Security event recorded.",
+        "id": security_event.id,
+    }), 201
+
 
 # -------------------------------------------------------
 # Granjas CRUD
