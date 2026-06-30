@@ -30,6 +30,9 @@ mosquitto/config/passwd
 debug/
 backups/
 *.sql
+
+# Las migraciones SQL forman parte del código versionado.
+!scripts/migrations/*.sql
 *.dump
 *.bak
 
