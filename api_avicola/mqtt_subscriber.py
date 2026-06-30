@@ -4,6 +4,8 @@ import math
 import re
 import paho.mqtt.client as mqtt
 import requests, json, uuid, time, os
+import logging
+import sys
 
 # environment variables
 API_URL = os.getenv('API_URL', 'http://localhost:5000/lecturas')
@@ -18,6 +20,46 @@ MQTT_TLS_CA_CERT = os.getenv("MQTT_TLS_CA_CERT")
 # - Esquema viejo: sensor/modulo1/temperatura, sensor/modulo1/humedad, etc.
 # - Esquema nuevo: sensor/modulo1/data (JSON con todos los valores)
 MQTT_TOPIC = os.getenv('MQTT_TOPIC', 'sensor/#')
+
+
+class UTCLogFormatter(logging.Formatter):
+    """Formatear logs del subscriber en UTC para correlacionarlos con Docker."""
+    converter = time.gmtime
+
+
+def configure_component_logger(name):
+    log = logging.getLogger(name)
+
+    if not log.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            UTCLogFormatter(
+                "%(asctime)sZ %(levelname)s %(name)s %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S",
+            )
+        )
+        log.addHandler(handler)
+
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    log.setLevel(getattr(logging, level_name, logging.INFO))
+    log.propagate = False
+    return log
+
+
+logger = configure_component_logger("avicola.mqtt")
+logger.info(
+    "event=logging_initialized component=mqtt_subscriber level=%s",
+    logging.getLevelName(logger.level),
+)
+
+
+def safe_log_value(value, fallback="-", limit=150):
+    """Normalizar valores externos para logs key=value sin saltos de línea."""
+    if value is None:
+        return fallback
+
+    normalized = " ".join(str(value).split()).replace("=", "_")
+    return normalized[:limit] or fallback
 
 
 SENSOR_LIMITS = {
@@ -138,18 +180,30 @@ def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def log_mqtt_rejection(event, reason, topic, module_id=None):
+    logger.warning(
+        "event=%s reason=%s module=%s topic=%s",
+        safe_log_value(event, limit=64),
+        safe_log_value(reason, limit=80),
+        safe_log_value(module_id, limit=32),
+        safe_log_value(topic, limit=150),
+    )
+
+
 def handle_node_status(topic, payload_text, retained):
     module_id, topic_error = normalize_module_from_topic(topic, "status")
 
     if topic_error:
-        print(f"[DROP] {topic_error} Topic: {topic}")
+        log_mqtt_rejection("node_status_rejected", "invalid_topic", topic)
         return
 
     status = payload_text.strip().lower()
     if status not in {"online", "offline"}:
-        print(
-            f"[DROP] Estado inválido en {topic}. "
-            "Solo se permite online u offline."
+        log_mqtt_rejection(
+            "node_status_rejected",
+            "invalid_status",
+            topic,
+            module_id,
         )
         return
 
@@ -161,9 +215,11 @@ def handle_node_status(topic, payload_text, retained):
         "last_seen": observed_at,
     })
 
-    print(
-        f"[NODE] {module_id} status={status} "
-        f"retained={retained} observed_at={observed_at}"
+    logger.info(
+        "event=node_status_changed module=%s status=%s retained=%s",
+        safe_log_value(module_id, limit=32),
+        safe_log_value(status, limit=16),
+        int(bool(retained)),
     )
 
 
@@ -171,44 +227,79 @@ def handle_node_heartbeat(topic, payload_text):
     module_id, topic_error = normalize_module_from_topic(topic, "heartbeat")
 
     if topic_error:
-        print(f"[DROP] {topic_error} Topic: {topic}")
+        log_mqtt_rejection("node_heartbeat_rejected", "invalid_topic", topic)
         return
 
     try:
         heartbeat = json.loads(payload_text)
     except json.JSONDecodeError:
-        print(f"[DROP] Heartbeat inválido en {topic}: JSON no válido.")
+        log_mqtt_rejection(
+            "node_heartbeat_rejected",
+            "invalid_json",
+            topic,
+            module_id,
+        )
         return
 
     if not isinstance(heartbeat, dict):
-        print(f"[DROP] Heartbeat inválido en {topic}: se esperaba un objeto JSON.")
+        log_mqtt_rejection(
+            "node_heartbeat_rejected",
+            "invalid_shape",
+            topic,
+            module_id,
+        )
         return
 
     timestamp = heartbeat.get("timestamp")
     if not isinstance(timestamp, str) or not timestamp.strip():
-        print(f"[DROP] Heartbeat inválido en {topic}: timestamp requerido.")
+        log_mqtt_rejection(
+            "node_heartbeat_rejected",
+            "missing_timestamp",
+            topic,
+            module_id,
+        )
         return
 
     try:
         datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError:
-        print(f"[DROP] Heartbeat inválido en {topic}: timestamp ISO 8601 inválido.")
+        log_mqtt_rejection(
+            "node_heartbeat_rejected",
+            "invalid_timestamp",
+            topic,
+            module_id,
+        )
         return
 
     uptime_seconds = heartbeat.get("uptime_seconds")
     if uptime_seconds is not None:
         if isinstance(uptime_seconds, bool):
-            print(f"[DROP] Heartbeat inválido en {topic}: uptime_seconds no puede ser booleano.")
+            log_mqtt_rejection(
+                "node_heartbeat_rejected",
+                "invalid_uptime_type",
+                topic,
+                module_id,
+            )
             return
 
         try:
             uptime_seconds = float(uptime_seconds)
         except (TypeError, ValueError):
-            print(f"[DROP] Heartbeat inválido en {topic}: uptime_seconds debe ser numérico.")
+            log_mqtt_rejection(
+                "node_heartbeat_rejected",
+                "invalid_uptime_type",
+                topic,
+                module_id,
+            )
             return
 
         if not math.isfinite(uptime_seconds) or uptime_seconds < 0:
-            print(f"[DROP] Heartbeat inválido en {topic}: uptime_seconds inválido.")
+            log_mqtt_rejection(
+                "node_heartbeat_rejected",
+                "invalid_uptime",
+                topic,
+                module_id,
+            )
             return
 
     observed_at = utc_now_iso()
@@ -218,18 +309,31 @@ def handle_node_heartbeat(topic, payload_text):
         "last_seen": observed_at,
     })
 
-    print(
-        f"[HEARTBEAT] {module_id} timestamp={timestamp} "
-        f"uptime_seconds={uptime_seconds} observed_at={observed_at}"
+    logger.info(
+        "event=node_heartbeat module=%s uptime_seconds=%s",
+        safe_log_value(module_id, limit=32),
+        safe_log_value(uptime_seconds, limit=32),
     )
 
+
 def on_connect(client, userdata, flags, rc):
-    print(f"Conected to MQTT broker: {rc}")
     if rc == 0:
         client.subscribe(MQTT_TOPIC, qos=1)
-        print("Topic:  ", MQTT_TOPIC)
+        logger.info(
+            "event=mqtt_connected broker=%s port=%s topic=%s tls_enabled=%s",
+            safe_log_value(MQTT_BROKER, limit=100),
+            MQTT_PORT,
+            safe_log_value(MQTT_TOPIC, limit=150),
+            MQTT_TLS_ENABLED,
+        )
     else:
-        print(f" Error de conexión MQTT: {rc}")
+        logger.error(
+            "event=mqtt_connection_failed result_code=%s broker=%s port=%s",
+            rc,
+            safe_log_value(MQTT_BROKER, limit=100),
+            MQTT_PORT,
+        )
+
 
 def on_message(client, userdata, message):
     try:
@@ -253,7 +357,11 @@ def on_message(client, userdata, message):
                 module_id, topic_error = normalize_module_from_topic(topic, "data")
 
                 if topic_error:
-                    print(f"[DROP] {topic_error} Topic: {topic}")
+                    log_mqtt_rejection(
+                        "telemetry_rejected",
+                        "invalid_topic",
+                        topic,
+                    )
                     return
 
                 current_time = datetime.now()
@@ -275,13 +383,22 @@ def on_message(client, userdata, message):
                 )
 
                 if validation_errors:
-                    print(
-                        f"[DROP] Payload rechazado en {topic}: "
-                        f"{'; '.join(validation_errors)}"
+                    logger.warning(
+                        "event=telemetry_rejected source=json reason=validation_failed "
+                        "module=%s reading_id=%s error_count=%s topic=%s",
+                        safe_log_value(module_id, limit=32),
+                        safe_log_value(lectura_json.get("id_lectura")),
+                        len(validation_errors),
+                        safe_log_value(topic, limit=150),
                     )
                     return
 
-                print(f"[JSON] Payload validado desde {topic}: {validated_reading}")
+                logger.info(
+                    "event=telemetry_validated source=json module=%s reading_id=%s topic=%s",
+                    safe_log_value(validated_reading["modulo"], limit=32),
+                    safe_log_value(validated_reading["id_lectura"]),
+                    safe_log_value(topic, limit=150),
+                )
 
                 try:
                     response = requests.post(
@@ -292,24 +409,45 @@ def on_message(client, userdata, message):
                     )
 
                     if response.status_code in (200, 201):
-                        print(
-                            "Lectura JSON enviada a BD: "
-                            f"{validated_reading['id_lectura']}"
+                        logger.info(
+                            "event=telemetry_forwarded source=json module=%s "
+                            "reading_id=%s http_status=%s",
+                            safe_log_value(validated_reading["modulo"], limit=32),
+                            safe_log_value(validated_reading["id_lectura"]),
+                            response.status_code,
                         )
                     else:
-                        print(
-                            f"Error API (HTTP {response.status_code}): "
-                            f"{response.text}"
+                        logger.error(
+                            "event=telemetry_forward_failed source=json reason=api_http_error "
+                            "module=%s reading_id=%s http_status=%s",
+                            safe_log_value(validated_reading["modulo"], limit=32),
+                            safe_log_value(validated_reading["id_lectura"]),
+                            response.status_code,
                         )
 
                 except requests.exceptions.ConnectionError:
-                    print("ERROR: No se pudo conectar a la API en http://localhost:5000")
+                    logger.error(
+                        "event=telemetry_forward_failed source=json reason=api_connection "
+                        "module=%s reading_id=%s",
+                        safe_log_value(validated_reading["modulo"], limit=32),
+                        safe_log_value(validated_reading["id_lectura"]),
+                    )
 
                 except requests.exceptions.Timeout:
-                    print("ERROR: Timeout al conectar con la API")
+                    logger.error(
+                        "event=telemetry_forward_failed source=json reason=api_timeout "
+                        "module=%s reading_id=%s",
+                        safe_log_value(validated_reading["modulo"], limit=32),
+                        safe_log_value(validated_reading["id_lectura"]),
+                    )
 
-                except Exception as e:
-                    print(f"ERROR enviando a API (JSON): {e}")
+                except Exception:
+                    logger.exception(
+                        "event=telemetry_forward_failed source=json reason=unexpected_error "
+                        "module=%s reading_id=%s",
+                        safe_log_value(validated_reading["modulo"], limit=32),
+                        safe_log_value(validated_reading["id_lectura"]),
+                    )
 
                 return
 
@@ -323,13 +461,22 @@ def on_message(client, userdata, message):
         try:
             value = float(payload_text)
         except ValueError:
-            # Ni JSON ni número válido
+            log_mqtt_rejection(
+                "telemetry_rejected",
+                "unsupported_payload",
+                topic,
+            )
             return
 
         parts = topic.split("/")
         if len(parts) < 3:
-            return 
-            
+            log_mqtt_rejection(
+                "telemetry_rejected",
+                "invalid_legacy_topic",
+                topic,
+            )
+            return
+
         module_raw = parts[1]                      # 'modulo1'
         sensor_type = parts[2]
         module_num = module_raw.replace('modulo', '')  # '1'
@@ -394,9 +541,13 @@ def on_message(client, userdata, message):
             )
 
             if validation_errors:
-                print(
-                    f"[DROP] Lectura antigua rechazada en {topic}: "
-                    f"{'; '.join(validation_errors)}"
+                logger.warning(
+                    "event=telemetry_rejected source=legacy reason=validation_failed "
+                    "module=%s reading_id=%s error_count=%s topic=%s",
+                    safe_log_value(reading.get("modulo"), limit=32),
+                    safe_log_value(reading.get("id_lectura")),
+                    len(validation_errors),
+                    safe_log_value(topic, limit=150),
                 )
 
                 if reading_id in current_readings:
@@ -404,46 +555,77 @@ def on_message(client, userdata, message):
 
                 return
 
-            print(f"[LEGACY] Payload validado: {validated_reading}")
+            logger.info(
+                "event=telemetry_validated source=legacy module=%s reading_id=%s topic=%s",
+                safe_log_value(validated_reading["modulo"], limit=32),
+                safe_log_value(validated_reading["id_lectura"]),
+                safe_log_value(topic, limit=150),
+            )
 
             try:
                 response = requests.post(
                     API_URL,
                     json=validated_reading,
                     headers=build_api_headers(),
-                    timeout=5
+                    timeout=5,
                 )
 
                 if response.status_code in (200, 201):
-                    print(
-                        "Lectura antigua enviada a BD: "
-                        f"{validated_reading['id_lectura']}"
+                    logger.info(
+                        "event=telemetry_forwarded source=legacy module=%s "
+                        "reading_id=%s http_status=%s",
+                        safe_log_value(validated_reading["modulo"], limit=32),
+                        safe_log_value(validated_reading["id_lectura"]),
+                        response.status_code,
                     )
 
                     if reading_id in current_readings:
                         del current_readings[reading_id]
-                        print(f"Lectura {reading_id} eliminada del buffer")
+                        logger.info(
+                            "event=legacy_buffer_entry_removed reading_id=%s reason=forwarded",
+                            safe_log_value(reading_id),
+                        )
                 else:
-                    print(
-                        f"Error API (HTTP {response.status_code}): "
-                        f"{response.text}"
+                    logger.error(
+                        "event=telemetry_forward_failed source=legacy reason=api_http_error "
+                        "module=%s reading_id=%s http_status=%s",
+                        safe_log_value(validated_reading["modulo"], limit=32),
+                        safe_log_value(validated_reading["id_lectura"]),
+                        response.status_code,
                     )
 
             except requests.exceptions.ConnectionError:
-                print("ERROR: No se pudo conectar a la API en http://localhost:5000")
+                logger.error(
+                    "event=telemetry_forward_failed source=legacy reason=api_connection "
+                    "module=%s reading_id=%s",
+                    safe_log_value(validated_reading["modulo"], limit=32),
+                    safe_log_value(validated_reading["id_lectura"]),
+                )
 
             except requests.exceptions.Timeout:
-                print("ERROR: Timeout al conectar con la API")
+                logger.error(
+                    "event=telemetry_forward_failed source=legacy reason=api_timeout "
+                    "module=%s reading_id=%s",
+                    safe_log_value(validated_reading["modulo"], limit=32),
+                    safe_log_value(validated_reading["id_lectura"]),
+                )
 
-            except Exception as e:
-                print(f"ERROR enviando a API: {e}")
+            except Exception:
+                logger.exception(
+                    "event=telemetry_forward_failed source=legacy reason=unexpected_error "
+                    "module=%s reading_id=%s",
+                    safe_log_value(validated_reading["modulo"], limit=32),
+                    safe_log_value(validated_reading["id_lectura"]),
+                )
 
         # ✅ MEJORADO: Limpiar lecturas antiguas (> 30 segundos)
         cleanup_old_readings()
 
     except Exception:
-        # Cualquier error inesperado se ignora para no tumbar el subscriber
-        pass
+        logger.exception(
+            "event=mqtt_message_processing_failed topic=%s",
+            safe_log_value(locals().get("topic"), limit=150),
+        )
 
 def cleanup_old_readings():
     """Clear old readings from buffer"""
@@ -457,22 +639,28 @@ def cleanup_old_readings():
             keys_to_delete.append(reading_id)
     
     for key in keys_to_delete:
-        print(f"Deleting old values: {key}")
         del current_readings[key]
+        logger.info(
+            "event=legacy_buffer_entry_removed reading_id=%s reason=expired",
+            safe_log_value(key),
+        )
 
 def start():
-    print(" STARTING MQTT SUBSCRIBER MODULE")
-    print(" MQTT CONFIGURATION:")
-    print(f"    API_URL: {API_URL}")
-    print(f"    MQTT_BROKER: {MQTT_BROKER}")
-    print(f"    MQTT_PORT: {MQTT_PORT}")
-    print(f"    MQTT_TOPIC: {MQTT_TOPIC}")
+    logger.info(
+        "event=service_started component=mqtt_subscriber broker=%s port=%s "
+        "topic=%s tls_enabled=%s api_url_configured=%s",
+        safe_log_value(MQTT_BROKER, limit=100),
+        MQTT_PORT,
+        safe_log_value(MQTT_TOPIC, limit=150),
+        MQTT_TLS_ENABLED,
+        bool(API_URL),
+    )
 
-    
     try:
         client = mqtt.Client()
         if MQTT_USERNAME and MQTT_PASSWORD:
             client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
         if MQTT_TLS_ENABLED:
             if not MQTT_TLS_CA_CERT:
                 raise RuntimeError(
@@ -487,14 +675,23 @@ def start():
 
         client.connect(MQTT_BROKER, MQTT_PORT, 60)
         client.loop_forever()
-        
+
     except ConnectionRefusedError:
-        print("ERROR: MQTT connection refused")
-    except Exception as e:
-        print(f"ERROR: MQTT configuration error {e}")
+        logger.error(
+            "event=mqtt_connection_refused broker=%s port=%s",
+            safe_log_value(MQTT_BROKER, limit=100),
+            MQTT_PORT,
+        )
+    except Exception:
+        logger.exception(
+            "event=mqtt_startup_failed broker=%s port=%s",
+            safe_log_value(MQTT_BROKER, limit=100),
+            MQTT_PORT,
+        )
+
 
 def stop():
-    print("🛑 Deteniendo suscriptor MQTT...")
+    logger.info("event=service_stopping component=mqtt_subscriber")
 
 if __name__ == "__main__":
     start()

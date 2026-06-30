@@ -12,6 +12,9 @@ import jwt
 import hmac
 from datetime import datetime, timedelta
 import requests
+import logging
+import sys
+import time
 
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
@@ -25,14 +28,63 @@ def send_telegram_alert(message: str) -> None:
             params={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
             timeout=5
         )
-    except Exception as e:
-        print(f"[Telegram] Error enviando alerta: {e}")
+    except Exception as exc:
+        logger.warning(
+            "event=telegram_alert_failed error_type=%s",
+            type(exc).__name__,
+        )
 
 
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 load_dotenv()
+
+
+class UTCLogFormatter(logging.Formatter):
+    """Formatear logs de aplicación en UTC para correlacionarlos con Docker."""
+    converter = time.gmtime
+
+
+def configure_component_logger(name):
+    log = logging.getLogger(name)
+
+    if not log.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            UTCLogFormatter(
+                "%(asctime)sZ %(levelname)s %(name)s %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S",
+            )
+        )
+        log.addHandler(handler)
+
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    log.setLevel(getattr(logging, level_name, logging.INFO))
+    log.propagate = False
+    return log
+
+
+logger = configure_component_logger("avicola.api")
+logger.info(
+    "event=logging_initialized component=api level=%s",
+    logging.getLevelName(logger.level),
+)
+
+
+def safe_log_value(value, fallback="-", limit=100):
+    """Reducir valores externos a una forma segura para logs key=value."""
+    if value is None:
+        return fallback
+
+    normalized = " ".join(str(value).split()).replace("=", "_")
+    return normalized[:limit] or fallback
+
+
+def request_source_ip():
+    """Registrar la IP observada por Flask sin alterar la configuración del proxy."""
+    return safe_log_value(request.remote_addr, limit=64)
+
 
 app = Flask(__name__)
 
@@ -348,7 +400,12 @@ def check_and_create_alerts():
                 time_diff = datetime.utcnow() - last_alert.timestamp
                 # If less than 60 seconds has passed, skip creating a new alert
                 if time_diff.total_seconds() < 60:
-                    print(f"Skipping alert for {variable} in {modulo}: too recent ({int(time_diff.total_seconds())}s ago)")
+                    logger.debug(
+                    "event=alert_skipped_recent variable=%s module=%s elapsed_seconds=%s",
+                    safe_log_value(variable, limit=64),
+                    safe_log_value(modulo, limit=32),
+                    int(time_diff.total_seconds()),
+                    )
                     continue
 
             # Determine priority and create alert
@@ -503,6 +560,10 @@ def insert_lectura():
     """Endpoint MQTT insertions with input validation."""
     try:
         if not validate_ingest_key():
+            logger.warning(
+                "event=telemetry_ingest_unauthorized source_ip=%s",
+                request_source_ip(),
+            )
             return jsonify({
                 "error": "No autorizado.",
                 "details": ["Se requiere una llave de ingestión válida."]
@@ -510,6 +571,10 @@ def insert_lectura():
         data = request.get_json(silent=True)
 
         if data is None:
+            logger.warning(
+                "event=telemetry_rejected reason=json_missing source_ip=%s",
+                request_source_ip(),
+            )
             return jsonify({
                 "error": "JSON inválido o ausente.",
                 "details": ["La solicitud debe incluir un cuerpo JSON válido."]
@@ -518,12 +583,25 @@ def insert_lectura():
         validated_data, validation_errors = validate_lectura_payload(data)
 
         if validation_errors:
+            raw_module = data.get("modulo") if isinstance(data, dict) else None
+            logger.warning(
+                "event=telemetry_rejected reason=validation_failed module=%s "
+                "error_count=%s source_ip=%s",
+                safe_log_value(raw_module, limit=32),
+                len(validation_errors),
+                request_source_ip(),
+            )
             return jsonify({
                 "error": "Validación fallida.",
                 "details": validation_errors
             }), 422
 
-        print(f"MQTT INSERT VALIDATED: {validated_data}")
+        logger.info(
+            "event=telemetry_validated module=%s reading_id=%s source_ip=%s",
+            safe_log_value(validated_data["modulo"], limit=32),
+            safe_log_value(validated_data["id_lectura"]),
+            request_source_ip(),
+        )
 
         nueva_lectura = Lectura(
             id_lectura=validated_data['id_lectura'],
@@ -542,10 +620,18 @@ def insert_lectura():
 
         try:
             check_and_create_alerts()
-        except Exception as e:
-            print(f"Error checking/creating alerts after MQTT insert: {e}")
+        except Exception:
+            logger.exception(
+                "event=alert_creation_failed module=%s reading_id=%s",
+                safe_log_value(validated_data["modulo"], limit=32),
+                safe_log_value(validated_data["id_lectura"]),
+            )
 
-        print(f"MQTT VALUES INSERTED in DB: {validated_data['id_lectura']}")
+        logger.info(
+            "event=telemetry_inserted module=%s reading_id=%s",
+            safe_log_value(validated_data["modulo"], limit=32),
+            safe_log_value(validated_data["id_lectura"]),
+        )
 
         return jsonify({
             "msg": "Record inserted successfully MQTT - DB",
@@ -554,14 +640,21 @@ def insert_lectura():
 
     except IntegrityError:
         db.session.rollback()
+        logger.warning(
+            "event=telemetry_insert_rejected reason=duplicate source_ip=%s",
+            request_source_ip(),
+        )
         return jsonify({
             "error": "Registro duplicado.",
             "details": ["Ya existe una lectura con el mismo id_lectura."]
         }), 409
 
-    except Exception as e:
-        print(f"Error Inserting MQTT VALUES: {e}")
+    except Exception:
         db.session.rollback()
+        logger.exception(
+            "event=telemetry_insert_failed source_ip=%s",
+            request_source_ip(),
+        )
         return jsonify({
             "error": "Error interno al insertar lectura."
         }), 500
@@ -593,7 +686,11 @@ def get_lecturas():
         }]
         return jsonify(lista)
     except Exception as e:
-        print(f"Error getting last record: {e}")
+        logger.exception(
+        "event=latest_record_query_failed module=%s source_ip=%s",
+        safe_log_value(locals().get("modulo"), limit=32),
+        request_source_ip(),
+        )
         return jsonify({'error': str(e)}), 500
 
 # Live data endpoint for dashboard
@@ -624,7 +721,11 @@ def get_live_data():
         }
         return jsonify(data)
     except Exception as e:
-        print(f"Error getting live data: {e}")
+        logger.exception(
+        "event=live_data_query_failed module=%s source_ip=%s",
+        safe_log_value(locals().get("modulo"), limit=32),
+        request_source_ip(),
+        )
         return jsonify({'error': str(e)}), 500
 
 
@@ -693,10 +794,19 @@ def historical_data():
             step = len(lecturas) // MAX_POINTS
             lecturas = lecturas[::step]
 
-        print(f"Obteniendo {len(lecturas)} lecturas para rango: {range_param}, casa: {house_param}")
+        logger.debug(
+        "event=historical_query_completed range=%s module=%s record_count=%s",
+        safe_log_value(range_param, limit=32),
+        safe_log_value(house_param, limit=32),
+        len(lecturas),
+        )
         
         if not lecturas:
-            print("⚠️ No hay lecturas en el rango solicitado")
+            logger.debug(
+            "event=historical_query_empty range=%s module=%s",
+            safe_log_value(range_param, limit=32),
+            safe_log_value(house_param, limit=32),
+            )
             return jsonify({
                 "timestamps": [],
                 "house": [],
@@ -720,7 +830,12 @@ def historical_data():
         }
         return jsonify(data)
     except Exception as e:
-        print(f"❌ Error en /api/historical: {e}")
+        logger.exception(
+        "event=historical_query_failed range=%s module=%s source_ip=%s",
+        safe_log_value(locals().get("range_param"), limit=32),
+        safe_log_value(locals().get("house_param"), limit=32),
+        request_source_ip(),
+        )
         return jsonify({
             "timestamps": [],
             "temperature": [],
@@ -777,6 +892,13 @@ def login_user():
 
         if user and user.check_password(password):
             access_token = generate_jwt_token(user)
+            logger.info(
+                "event=login_succeeded user_id=%s username=%s role=%s source_ip=%s",
+                user.id,
+                safe_log_value(user.username, limit=64),
+                safe_log_value(user.role, limit=32),
+                request_source_ip(),
+            )
 
             return jsonify({
                 "msg": "Login successful",
@@ -786,10 +908,18 @@ def login_user():
                 "user": serialize_user(user)
             }), 200
 
+        logger.warning(
+            "event=login_failed username=%s source_ip=%s",
+            safe_log_value(username, limit=64),
+            request_source_ip(),
+        )
         return jsonify({"error": "Invalid credentials"}), 401
 
-    except Exception as e:
-        print(f"Error in login: {e}")
+    except Exception:
+        logger.exception(
+            "event=login_processing_failed source_ip=%s",
+            request_source_ip(),
+        )
         return jsonify({"error": "Error interno durante login."}), 500
 @app.route('/api/auth/verify', methods=['GET'])
 def verify_auth_token():
@@ -907,10 +1037,23 @@ def update_umbrales():
                 db.session.add(umbral)
         
         db.session.commit()
+        logger.info(
+            "event=thresholds_updated actor_user_id=%s actor_role=%s "
+            "updated_count=%s source_ip=%s",
+            request.current_user.id,
+            safe_log_value(request.current_user.role, limit=32),
+            len(data),
+            request_source_ip(),
+        )
         return jsonify({'message': 'Thresholds updated successfully'}), 200
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        logger.exception(
+            "event=thresholds_update_failed actor_user_id=%s source_ip=%s",
+            getattr(getattr(request, "current_user", None), "id", "-"),
+            request_source_ip(),
+        )
+        return jsonify({'error': 'Error interno al actualizar umbrales.'}), 500
 
 @app.route('/api/umbrales/init', methods=['POST'])
 @auth_required(roles=["admin"])
@@ -967,10 +1110,17 @@ def get_historical_data(range, from_date=None, to_date=None):
             data = response.json()
             return data
         else:
-            print(f"Error HTTP: {response.status_code}")
+            logger.warning(
+            "event=historical_proxy_http_error http_status=%s range=%s",
+            response.status_code,
+            safe_log_value(range, limit=32),
+            )
             return None
     except Exception as e:
-        print(f"Error obteniendo datos históricos: {e}")
+        logger.exception(
+        "event=historical_proxy_request_failed range=%s",
+        safe_log_value(range, limit=32),
+        )
         return None
 
 # Alerts API endpoints
@@ -1028,7 +1178,13 @@ def get_alerts():
 
         return jsonify(result)
     except Exception as e:
-        print(f"Error getting alerts: {e}")
+        logger.exception(
+        "event=alerts_query_failed priority=%s status=%s module=%s source_ip=%s",
+        safe_log_value(locals().get("priority"), limit=32),
+        safe_log_value(locals().get("status"), limit=32),
+        safe_log_value(locals().get("modulo"), limit=32),
+        request_source_ip(),
+        )
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/alerts/<int:alert_id>', methods=['PUT'])
@@ -1047,7 +1203,11 @@ def update_alert(alert_id):
         db.session.commit()
         return jsonify({'message': 'Alert updated successfully'})
     except Exception as e:
-        print(f"Error updating alert: {e}")
+        logger.exception(
+        "event=alert_update_failed alert_id=%s source_ip=%s",
+        alert_id,
+        request_source_ip(),
+        )
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/alerts/stats', methods=['GET'])
@@ -1066,7 +1226,10 @@ def get_alert_stats():
             'resolved': resolved
         })
     except Exception as e:
-        print(f"Error getting alert stats: {e}")
+        logger.exception(
+        "event=alert_stats_query_failed source_ip=%s",
+        request_source_ip(),
+        )
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/alerts/mark-all', methods=['PUT'])
@@ -1081,7 +1244,10 @@ def mark_all_alerts():
         db.session.commit()
         return jsonify({'message': f'Marked {len(alerts)} alerts as acknowledged'})
     except Exception as e:
-        print(f"Error marking all alerts: {e}")
+        logger.exception(
+        "event=alerts_mark_all_failed source_ip=%s",
+        request_source_ip(),
+        )
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/alerts/all', methods=['DELETE'])
@@ -1093,7 +1259,10 @@ def delete_all_alerts():
         db.session.commit()
         return jsonify({'message': f'Se eliminaron {num_deleted} alertas correctamente'})
     except Exception as e:
-        print(f"Error deleting all alerts: {e}")
+        logger.exception(
+        "event=alerts_delete_all_failed source_ip=%s",
+        request_source_ip(),
+        )
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
 
@@ -1105,7 +1274,10 @@ def trigger_alert_check():
         check_and_create_alerts()
         return jsonify({'message': 'Alert check completed successfully'})
     except Exception as e:
-        print(f"Error checking alerts: {e}")
+        logger.exception(
+        "event=alerts_check_failed source_ip=%s",
+        request_source_ip(),
+        )
         return jsonify({'error': str(e)}), 500
 
 # -------------------------------------------------------
