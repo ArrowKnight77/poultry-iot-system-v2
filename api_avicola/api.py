@@ -111,6 +111,50 @@ if not jwt_secret_key or len(jwt_secret_key) < 32:
 
 jwt_access_token_expires_minutes = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRES_MINUTES", "60"))
 
+
+def read_positive_security_int(name, default, minimum=1, maximum=1440):
+    """Leer enteros de configuración con límites seguros."""
+    raw_value = os.getenv(name, str(default))
+
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "event=security_config_invalid setting=%s fallback=%s",
+            name,
+            default,
+        )
+        return default
+
+    if not minimum <= value <= maximum:
+        logger.warning(
+            "event=security_config_out_of_range setting=%s fallback=%s",
+            name,
+            default,
+        )
+        return default
+
+    return value
+
+
+login_max_failures = read_positive_security_int(
+    "LOGIN_MAX_FAILURES",
+    5,
+    minimum=1,
+    maximum=20,
+)
+login_failure_window_minutes = read_positive_security_int(
+    "LOGIN_FAILURE_WINDOW_MINUTES",
+    15,
+)
+login_lockout_minutes = read_positive_security_int(
+    "LOGIN_LOCKOUT_MINUTES",
+    15,
+)
+
+login_failure_window = timedelta(minutes=login_failure_window_minutes)
+login_lockout_duration = timedelta(minutes=login_lockout_minutes)
+
 app.config.update(
     SECRET_KEY=secret_key,
     SESSION_COOKIE_HTTPONLY=True,
@@ -183,6 +227,34 @@ class User(db.Model):
     def check_password(self, password):
         """Check if the provided password matches the hash"""
         return check_password_hash(self.password_hash, password)
+
+
+class LoginLockout(db.Model):
+    """Estado persistente de fallos y bloqueos temporales por usuario."""
+
+    __tablename__ = "login_lockouts"
+
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), nullable=False, unique=True)
+    failed_attempts = db.Column(db.Integer, nullable=False, default=0)
+    window_started_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+    )
+    last_failed_at = db.Column(db.DateTime)
+    locked_until = db.Column(db.DateTime, index=True)
+    last_source_ip = db.Column(db.String(64))
+    created_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+    )
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+    )
 
 def serialize_user(user):
     """Return safe user data for API responses."""
@@ -438,6 +510,106 @@ def serialize_security_event(security_event):
             else None
         ),
     }
+
+
+def normalize_login_username(username):
+    """Normalizar el identificador usado para contar fallos."""
+    return (username or "").strip().casefold()
+
+
+def get_active_login_lockout(username, now=None):
+    """Obtener un bloqueo todavía vigente para el usuario indicado."""
+    now = now or datetime.utcnow()
+
+    lockout = LoginLockout.query.filter_by(username=username).first()
+
+    if lockout and lockout.locked_until and lockout.locked_until > now:
+        return lockout
+
+    return None
+
+
+def get_login_lockout_retry_after_seconds(lockout, now=None):
+    """Calcular segundos restantes para el header Retry-After."""
+    now = now or datetime.utcnow()
+
+    if not lockout or not lockout.locked_until:
+        return 1
+
+    remaining_seconds = (lockout.locked_until - now).total_seconds()
+    return max(1, int(remaining_seconds + 0.999))
+
+
+def register_login_failure(username, source_ip, now=None):
+    """Registrar un fallo y bloquear temporalmente si alcanza el límite."""
+    now = now or datetime.utcnow()
+
+    lockout = LoginLockout.query.filter_by(username=username).first()
+
+    if lockout is None:
+        lockout = LoginLockout(
+            username=username,
+            failed_attempts=0,
+            window_started_at=now,
+            last_source_ip=source_ip,
+        )
+        db.session.add(lockout)
+
+    window_expired = (
+        not lockout.window_started_at
+        or now - lockout.window_started_at >= login_failure_window
+    )
+    previous_lock_expired = (
+        lockout.locked_until is not None
+        and lockout.locked_until <= now
+    )
+
+    if window_expired or previous_lock_expired:
+        lockout.failed_attempts = 0
+        lockout.window_started_at = now
+        lockout.locked_until = None
+
+    lockout.failed_attempts += 1
+    lockout.last_failed_at = now
+    lockout.last_source_ip = source_ip
+    lockout.updated_at = now
+
+    lockout_triggered = lockout.failed_attempts >= login_max_failures
+
+    if lockout_triggered:
+        lockout.locked_until = now + login_lockout_duration
+
+    db.session.commit()
+
+    return lockout, lockout_triggered
+
+
+def clear_login_lockout(username):
+    """Eliminar el contador después de un inicio de sesión válido."""
+    lockout = LoginLockout.query.filter_by(username=username).first()
+
+    if not lockout:
+        return
+
+    db.session.delete(lockout)
+    db.session.commit()
+
+    logger.info(
+        "event=login_lockout_cleared username=%s",
+        safe_log_value(username, limit=64),
+    )
+
+
+def build_login_lockout_response(retry_after_seconds):
+    """Responder sin revelar detalles sensibles sobre la cuenta."""
+    response = jsonify({
+        "error": "Cuenta bloqueada temporalmente. Intenta de nuevo más tarde.",
+        "retry_after_seconds": retry_after_seconds,
+    })
+    response.status_code = 429
+    response.headers["Retry-After"] = str(retry_after_seconds)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 class Granja(db.Model):
@@ -1030,7 +1202,7 @@ def register_user():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/login', methods=['POST'])
-@limiter.limit("10 per minute")  # Brute-force protection
+@limiter.limit("10 per minute")  # Protección complementaria por IP
 def login_user():
     try:
         data = request.get_json(silent=True)
@@ -1048,16 +1220,52 @@ def login_user():
                 "error": "Usuario y contraseña son requeridos."
             }), 400
 
+        if len(username) > 80:
+            return jsonify({
+                "error": "Usuario inválido."
+            }), 400
+
+        lockout_username = normalize_login_username(username)
+        source_ip = request_source_ip()
+        now = datetime.utcnow()
+
+        active_lockout = get_active_login_lockout(lockout_username, now)
+
+        if active_lockout:
+            retry_after_seconds = get_login_lockout_retry_after_seconds(
+                active_lockout,
+                now,
+            )
+
+            logger.warning(
+                "event=login_blocked username=%s source_ip=%s retry_after_seconds=%s",
+                safe_log_value(username, limit=64),
+                source_ip,
+                retry_after_seconds,
+            )
+            record_security_event(
+                event_type="login_blocked",
+                severity="warning",
+                source="api",
+                source_ip=source_ip,
+                actor_username=username,
+                reason="lockout_active",
+                retry_after_seconds=retry_after_seconds,
+            )
+            return build_login_lockout_response(retry_after_seconds)
+
         user = User.query.filter_by(username=username).first()
 
         if user and user.check_password(password):
+            clear_login_lockout(lockout_username)
+
             access_token = generate_jwt_token(user)
             logger.info(
                 "event=login_succeeded user_id=%s username=%s role=%s source_ip=%s",
                 user.id,
                 safe_log_value(user.username, limit=64),
                 safe_log_value(user.role, limit=32),
-                request_source_ip(),
+                source_ip,
             )
 
             return jsonify({
@@ -1068,19 +1276,54 @@ def login_user():
                 "user": serialize_user(user)
             }), 200
 
+        lockout, lockout_triggered = register_login_failure(
+            lockout_username,
+            source_ip,
+            now,
+        )
+
         logger.warning(
-            "event=login_failed username=%s source_ip=%s",
+            "event=login_failed username=%s source_ip=%s failed_attempts=%s",
             safe_log_value(username, limit=64),
-            request_source_ip(),
+            source_ip,
+            lockout.failed_attempts,
         )
         record_security_event(
             event_type="login_failed",
             severity="warning",
             source="api",
-            source_ip=request_source_ip(),
+            source_ip=source_ip,
             actor_username=username,
             reason="invalid_credentials",
+            failed_attempts=lockout.failed_attempts,
         )
+
+        if lockout_triggered:
+            retry_after_seconds = get_login_lockout_retry_after_seconds(
+                lockout,
+                now,
+            )
+
+            logger.warning(
+                "event=login_lockout_triggered username=%s source_ip=%s "
+                "failed_attempts=%s retry_after_seconds=%s",
+                safe_log_value(username, limit=64),
+                source_ip,
+                lockout.failed_attempts,
+                retry_after_seconds,
+            )
+            record_security_event(
+                event_type="login_lockout_triggered",
+                severity="warning",
+                source="api",
+                source_ip=source_ip,
+                actor_username=username,
+                reason="max_failed_attempts_reached",
+                failed_attempts=lockout.failed_attempts,
+                retry_after_seconds=retry_after_seconds,
+            )
+            return build_login_lockout_response(retry_after_seconds)
+
         return jsonify({"error": "Invalid credentials"}), 401
 
     except Exception:
@@ -1089,6 +1332,8 @@ def login_user():
             request_source_ip(),
         )
         return jsonify({"error": "Error interno durante login."}), 500
+
+
 @app.route('/api/auth/verify', methods=['GET'])
 def verify_auth_token():
     token = get_bearer_token()

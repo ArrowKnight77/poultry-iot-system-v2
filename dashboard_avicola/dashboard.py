@@ -163,17 +163,83 @@ def get_umbrales_from_api():
 @limiter.limit("10 per minute")
 def login():
     if request.method == 'POST':
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        if not username or not password:
+            flash("Usuario y contraseña son requeridos.")
+            return render_template("login.html")
+
+        api_url = os.getenv("API_BASE_URL", "http://api:5000").rstrip("/")
+
         try:
-            user = User.query.filter_by(username=request.form['username']).first()
-            if user and user.check_password(request.form['password']):
-                login_user(user)
-                return redirect('/dashboard')
-            flash('Usuario o contraseña incorrectos')
-        except Exception as e:
-            flash('Error en el sistema. Intente nuevamente.')
-            print(f"Error en login: {e}")
-    
-    return render_template('login.html')
+            api_response = requests.post(
+                f"{api_url}/api/login",
+                json={
+                    "username": username,
+                    "password": password,
+                },
+                timeout=5,
+            )
+        except requests.RequestException as exc:
+            app.logger.warning(
+                "dashboard_login_api_unavailable error_type=%s",
+                type(exc).__name__,
+            )
+            flash("No fue posible validar las credenciales. Intente nuevamente.")
+            return render_template("login.html")
+
+        try:
+            response_data = api_response.json()
+        except ValueError:
+            response_data = {}
+
+        if api_response.status_code == 200:
+            api_user = response_data.get("user", {})
+            user_id = api_user.get("id") if isinstance(api_user, dict) else None
+            user = db.session.get(User, user_id) if user_id else None
+
+            if not user:
+                app.logger.error(
+                    "dashboard_login_user_not_found user_id=%s",
+                    user_id,
+                )
+                flash("No fue posible iniciar la sesión. Contacte al administrador.")
+                return render_template("login.html")
+
+            # La API ya validó credenciales, bloqueo y contador persistente.
+            login_user(user)
+            return redirect("/dashboard")
+
+        if api_response.status_code == 429:
+            raw_retry_after = response_data.get(
+                "retry_after_seconds",
+                api_response.headers.get("Retry-After", "60"),
+            )
+
+            try:
+                retry_after_seconds = int(raw_retry_after)
+            except (TypeError, ValueError):
+                retry_after_seconds = 60
+
+            retry_after_seconds = min(max(retry_after_seconds, 1), 86400)
+
+            return render_template(
+                "login.html",
+                lockout_seconds=retry_after_seconds,
+            )
+
+        if api_response.status_code in (400, 401):
+            flash("Usuario o contraseña incorrectos")
+        else:
+            app.logger.warning(
+                "dashboard_login_api_error status=%s",
+                api_response.status_code,
+            )
+            flash("Error en el sistema. Intente nuevamente.")
+
+    return render_template("login.html")
+
 
 @app.route('/register', methods=['GET', 'POST'])
 @limiter.limit("5 per hour")
