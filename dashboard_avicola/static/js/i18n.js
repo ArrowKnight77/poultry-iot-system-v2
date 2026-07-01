@@ -50,6 +50,8 @@
       'login.swal_err_title': 'Error',
       'login.swal_err_default': 'Credenciales incorrectas',
       'login.swal_conn_error': 'Error de conexión',
+      'login.lockout_message': 'Cuenta bloqueada temporalmente. Intenta de nuevo más tarde.',
+      'login.lockout_remaining': 'Tiempo restante:',
 
       // Dashboard
       'dashboard.title': 'Dashboard',
@@ -329,6 +331,8 @@
       'login.swal_err_title': 'Error',
       'login.swal_err_default': 'Invalid credentials',
       'login.swal_conn_error': 'Connection error',
+      'login.lockout_message': 'Account temporarily locked. Try again later.',
+      'login.lockout_remaining': 'Time remaining:',
 
       // Dashboard
       'dashboard.title': 'Dashboard',
