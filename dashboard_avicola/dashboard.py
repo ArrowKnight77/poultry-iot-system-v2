@@ -346,6 +346,7 @@ def dashboard():
 
 
 @app.route('/api/historical')
+@login_required
 def api_historical():
     """Endpoint proxy para datos históricos - funciona desde cualquier dispositivo"""
     try:
@@ -385,93 +386,320 @@ def api_historical():
             "error": str(e)
         }), 500
 
-@app.route('/api/umbrales')
-def api_umbrales():
-    """Endpoint proxy para umbrales"""
+@app.route('/api/live-data')
+@login_required
+def api_live_data():
+    """Proxy autenticado para datos en tiempo real."""
     try:
-        data = get_umbrales_from_api()
-        return jsonify(data)
+        r = requests.get(
+            f'{_api_url()}/api/live-data',
+            params=request.args.to_dict(),
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/api/umbrales', methods=['GET', 'POST'])
+@login_required
+def api_umbrales():
+    """Proxy autenticado para consultar y actualizar umbrales."""
+    try:
+        if request.method == 'GET':
+            r = requests.get(
+                f'{_api_url()}/api/umbrales',
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        else:
+            r = requests.post(
+                f'{_api_url()}/api/umbrales',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 def _api_url():
-    return os.getenv('API_BASE_URL', 'http://localhost:5000')
+    return os.getenv('API_BASE_URL', 'http://localhost:5000').rstrip('/')
+
+
+def _dashboard_proxy_headers():
+    """Headers internos para que la API identifique al usuario real."""
+    proxy_key = os.getenv("DASHBOARD_PROXY_KEY", "")
+
+    if not proxy_key:
+        app.logger.error("dashboard_proxy_key_missing")
+
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    source_ip = (
+        forwarded_for.split(",", 1)[0].strip()
+        if forwarded_for
+        else request.remote_addr
+    )
+
+    return {
+        "X-Dashboard-Proxy-Key": proxy_key,
+        "X-Dashboard-User-Id": str(current_user.id),
+        "X-Dashboard-Source-IP": source_ip or "",
+    }
+
+
+def _proxy_json_response(response):
+    try:
+        return jsonify(response.json()), response.status_code
+    except ValueError:
+        return jsonify({
+            'error': 'Respuesta inválida desde API interna.'
+        }), response.status_code
+
+
+@app.route('/api/user/<int:user_id>', methods=['GET', 'PUT'])
+@login_required
+def proxy_user(user_id):
+    try:
+        if request.method == 'GET':
+            r = requests.get(
+                f'{_api_url()}/api/user/{user_id}',
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        else:
+            r = requests.put(
+                f'{_api_url()}/api/user/{user_id}',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+
+        return _proxy_json_response(r)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/alerts', methods=['GET'])
+@login_required
+def proxy_alerts():
+    try:
+        r = requests.get(
+            f'{_api_url()}/api/alerts',
+            params=request.args.to_dict(),
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/alerts/stats', methods=['GET'])
+@login_required
+def proxy_alert_stats():
+    try:
+        r = requests.get(
+            f'{_api_url()}/api/alerts/stats',
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/alerts/<int:alert_id>', methods=['PUT'])
+@login_required
+def proxy_alert(alert_id):
+    try:
+        r = requests.put(
+            f'{_api_url()}/api/alerts/{alert_id}',
+            json=request.get_json(silent=True),
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/alerts/mark-all', methods=['PUT'])
+@login_required
+def proxy_mark_all_alerts():
+    try:
+        r = requests.put(
+            f'{_api_url()}/api/alerts/mark-all',
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/alerts/all', methods=['DELETE'])
+@login_required
+def proxy_delete_all_alerts():
+    try:
+        r = requests.delete(
+            f'{_api_url()}/api/alerts/all',
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/alerts/check', methods=['POST'])
+@login_required
+def proxy_alert_check():
+    try:
+        r = requests.post(
+            f'{_api_url()}/api/alerts/check',
+            headers=_dashboard_proxy_headers(),
+            timeout=10,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/granjas', methods=['GET', 'POST'])
 @login_required
 def proxy_granjas():
     try:
         if request.method == 'GET':
-            r = requests.get(f'{_api_url()}/api/granjas', timeout=5)
+            r = requests.get(
+                f'{_api_url()}/api/granjas',
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
         else:
-            r = requests.post(f'{_api_url()}/api/granjas', json=request.get_json(), timeout=5)
-        return jsonify(r.json()), r.status_code
+            r = requests.post(
+                f'{_api_url()}/api/granjas',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        return _proxy_json_response(r)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/granjas/<int:granja_id>', methods=['PUT', 'DELETE'])
 @login_required
 def proxy_granja(granja_id):
     try:
         if request.method == 'PUT':
-            r = requests.put(f'{_api_url()}/api/granjas/{granja_id}', json=request.get_json(), timeout=5)
+            r = requests.put(
+                f'{_api_url()}/api/granjas/{granja_id}',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
         else:
-            r = requests.delete(f'{_api_url()}/api/granjas/{granja_id}', timeout=5)
-        return jsonify(r.json()), r.status_code
+            r = requests.delete(
+                f'{_api_url()}/api/granjas/{granja_id}',
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        return _proxy_json_response(r)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/naves', methods=['GET', 'POST'])
 @login_required
 def proxy_naves():
     try:
         if request.method == 'GET':
-            params = request.args.to_dict()
-            r = requests.get(f'{_api_url()}/api/naves', params=params, timeout=5)
+            r = requests.get(
+                f'{_api_url()}/api/naves',
+                params=request.args.to_dict(),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
         else:
-            r = requests.post(f'{_api_url()}/api/naves', json=request.get_json(), timeout=5)
-        return jsonify(r.json()), r.status_code
+            r = requests.post(
+                f'{_api_url()}/api/naves',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        return _proxy_json_response(r)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/naves/<int:nave_id>', methods=['PUT', 'DELETE'])
 @login_required
 def proxy_nave(nave_id):
     try:
         if request.method == 'PUT':
-            r = requests.put(f'{_api_url()}/api/naves/{nave_id}', json=request.get_json(), timeout=5)
+            r = requests.put(
+                f'{_api_url()}/api/naves/{nave_id}',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
         else:
-            r = requests.delete(f'{_api_url()}/api/naves/{nave_id}', timeout=5)
-        return jsonify(r.json()), r.status_code
+            r = requests.delete(
+                f'{_api_url()}/api/naves/{nave_id}',
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        return _proxy_json_response(r)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/modulos', methods=['GET'])
 @login_required
 def proxy_modulos():
     try:
-        r = requests.get(f'{_api_url()}/api/modulos', timeout=5)
-        return jsonify(r.json()), r.status_code
+        r = requests.get(
+            f'{_api_url()}/api/modulos',
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/modulos/<string:codigo>', methods=['PUT'])
 @login_required
 def proxy_modulo(codigo):
     try:
-        r = requests.put(f'{_api_url()}/api/modulos/{codigo}', json=request.get_json(), timeout=5)
-        return jsonify(r.json()), r.status_code
+        r = requests.put(
+            f'{_api_url()}/api/modulos/{codigo}',
+            json=request.get_json(silent=True),
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/parvada/<string:modulo>')
 @login_required
 def proxy_parvada(modulo):
     try:
-        r = requests.get(f'{_api_url()}/api/parvada/{modulo}', timeout=5)
-        return jsonify(r.json()), r.status_code
+        r = requests.get(
+            f'{_api_url()}/api/parvada/{modulo}',
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 #Redirigir la raíz '/' al login
 @app.route('/')

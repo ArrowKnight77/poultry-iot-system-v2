@@ -652,10 +652,7 @@ function setupRangeSelector() {
 }
 
 function getBaseUrl() {
-  const currentPort = window.location.port;
-  return currentPort === '5001'
-    ? `${window.location.protocol}//${window.location.hostname}:5000`
-    : window.location.origin;
+  return window.location.origin;
 }
 
 async function fetchHistoricalData(range, from = null, to = null) {
