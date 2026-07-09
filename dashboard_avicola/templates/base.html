@@ -223,7 +223,10 @@
           </div>
           <div class="mb-3">
             <label class="form-label" data-i18n="profile.role">Rol</label>
-            <input type="text" class="form-control" id="editRole" value="Administrador" maxlength="30">
+            <select class="form-select" id="editRole" disabled>
+              <option value="admin">Administrador</option>
+              <option value="User">Usuario</option>
+            </select>
           </div>
           <div class="mb-3">
             <label class="form-label" data-i18n="profile.initials">Iniciales</label>
@@ -303,7 +306,7 @@
     function getBaseUrl() {
       const currentPort = window.location.port;
       if (currentPort === '5001') {
-        return `${window.location.protocol}//${window.location.hostname}:5000`;
+        return window.location.origin;
       }
       return window.location.origin;
     }
@@ -346,31 +349,50 @@
     }
 
     function openProfileSettings() {
-      console.log('openProfileSettings called');
-      console.log('currentUser:', currentUser);
-      
-      if (!currentUser) {
-        console.log('No currentUser found');
-        return;
-      }
-      
-      console.log('Opening profile modal');
+      if (!currentUser) return;
+
       document.getElementById('editName').value = currentUser.full_name || '';
-      document.getElementById('editRole').value = currentUser.role || '';
+
+      const roleSelect = document.getElementById('editRole');
+      const normalizedRole = String(currentUser.role || '').trim().toLowerCase();
+
+      roleSelect.value = (
+        normalizedRole === 'admin' ||
+        normalizedRole === 'administrator'
+      ) ? 'admin' : 'User';
+
+      // El perfil propio no permite modificar permisos.
+      roleSelect.disabled = true;
+
       document.getElementById('editInitials').value = currentUser.initials || '';
 
-      const modal = new bootstrap.Modal(document.getElementById('profileModal'));
-      modal.show();
+      bootstrap.Modal.getOrCreateInstance(
+        document.getElementById('profileModal')
+      ).show();
     }
 
     async function saveProfile() {
       if (!currentUser) return;
 
-      const updates = {
-        full_name: document.getElementById('editName').value,
-        role: document.getElementById('editRole').value,
-        initials: document.getElementById('editInitials').value
-      };
+      const fullName = document.getElementById('editName').value.trim();
+      const initials = document.getElementById('editInitials').value.trim();
+
+      const updates = {};
+
+      if (fullName !== (currentUser.full_name || '')) {
+        updates.full_name = fullName;
+      }
+
+      if (initials !== (currentUser.initials || '')) {
+        updates.initials = initials;
+      }
+
+      if (Object.keys(updates).length === 0) {
+        bootstrap.Modal.getOrCreateInstance(
+          document.getElementById('profileModal')
+        ).hide();
+        return;
+      }
 
       try {
         const res = await fetch(`${getBaseUrl()}/api/user/${currentUser.id}`, {
@@ -379,17 +401,18 @@
           body: JSON.stringify(updates)
         });
 
-        if (res.ok) {
-          currentUser = { ...currentUser, ...updates };
-          localStorage.setItem('currentUser', JSON.stringify(currentUser));
-          updateProfileUI(currentUser);
-
-          const modalEl = document.getElementById('profileModal');
-          const modal = bootstrap.Modal.getInstance(modalEl);
-          modal.hide();
-        } else {
+        if (!res.ok) {
           alert(t('profile.error_update'));
+          return;
         }
+
+        currentUser = { ...currentUser, ...updates };
+        localStorage.setItem('currentUser', JSON.stringify(currentUser));
+        updateProfileUI(currentUser);
+
+        bootstrap.Modal.getOrCreateInstance(
+          document.getElementById('profileModal')
+        ).hide();
       } catch (err) {
         console.error(err);
         alert(t('profile.error_connection'));

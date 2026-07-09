@@ -139,7 +139,7 @@
 <script>
   let allAlerts = [];
   let filteredAlerts = [];
-  const API_BASE = `${window.location.protocol}//${window.location.hostname}:5000`;
+  const API_BASE = window.location.origin;
 
   async function populateModuleFilter() {
     try {
@@ -162,7 +162,7 @@
       const status   = document.getElementById('statusFilter').value;
       const module   = document.getElementById('moduleFilter').value;
 
-      let url = `${window.location.protocol}//${window.location.hostname}:5000/api/alerts`;
+      let url = `${API_BASE}/api/alerts`;
       const params = new URLSearchParams();
       if (priority !== 'all') params.append('priority', priority);
       if (status   !== 'all') params.append('status',   status);
@@ -189,7 +189,7 @@
 
   async function loadStats() {
     try {
-      const response = await fetch(`${window.location.protocol}//${window.location.hostname}:5000/api/alerts/stats`);
+      const response = await fetch(`${API_BASE}/api/alerts/stats`);
       if (!response.ok) throw new Error(response.statusText);
       const stats = await response.json();
       document.getElementById('criticalCount').textContent = stats.critical || 0;
@@ -204,7 +204,7 @@
   async function updateAlertStatus(id, status) {
     try {
       const response = await fetch(
-        `${window.location.protocol}//${window.location.hostname}:5000/api/alerts/${id}`,
+        `${API_BASE}/api/alerts/${id}`,
         { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ estado: status }) }
       );
       if (!response.ok) throw new Error(response.statusText);
@@ -218,7 +218,7 @@
   async function markAllAsRead() {
     try {
       const response = await fetch(
-        `${window.location.protocol}//${window.location.hostname}:5000/api/alerts/mark-all`,
+        `${API_BASE}/api/alerts/mark-all`,
         { method: 'PUT' }
       );
       if (!response.ok) throw new Error(response.statusText);
@@ -233,7 +233,7 @@
     if (!confirm(t('alerts.confirm_delete'))) return;
     try {
       const response = await fetch(
-        `${window.location.protocol}//${window.location.hostname}:5000/api/alerts/all`,
+        `${API_BASE}/api/alerts/all`,
         { method: 'DELETE' }
       );
       if (!response.ok) throw new Error(response.statusText);

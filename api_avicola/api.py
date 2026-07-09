@@ -105,6 +105,13 @@ if not security_events_api_key or len(security_events_api_key) < 32:
         "Debe tener al menos 32 caracteres."
     )
 
+dashboard_proxy_key = os.getenv("DASHBOARD_PROXY_KEY")
+if not dashboard_proxy_key or len(dashboard_proxy_key) < 32:
+    raise RuntimeError(
+        "DASHBOARD_PROXY_KEY no definida o demasiado corta. "
+        "Debe tener al menos 32 caracteres."
+    )
+
 jwt_secret_key = os.getenv("JWT_SECRET_KEY")
 if not jwt_secret_key or len(jwt_secret_key) < 32:
     raise RuntimeError("JWT_SECRET_KEY no definida o demasiado corta. Debe tener al menos 32 caracteres.")
@@ -298,8 +305,52 @@ def get_bearer_token():
 
     return auth_header.split(" ", 1)[1].strip()
 
+def validate_dashboard_proxy_key():
+    """Validar la llave interna usada por el dashboard dentro de Docker."""
+    provided_key = request.headers.get("X-Dashboard-Proxy-Key", "")
+
+    if not dashboard_proxy_key or not provided_key:
+        return False
+
+    return hmac.compare_digest(provided_key, dashboard_proxy_key)
+
+
+def get_dashboard_proxy_user():
+    """Obtener el usuario real delegado por el dashboard autenticado."""
+    if not validate_dashboard_proxy_key():
+        return None
+
+    raw_user_id = request.headers.get("X-Dashboard-User-Id", "").strip()
+
+    try:
+        user_id = int(raw_user_id)
+    except (TypeError, ValueError):
+        return None
+
+    if user_id <= 0:
+        return None
+
+    return User.query.get(user_id)
+
+
+def request_audit_source_ip():
+    """Obtener IP del cliente delegada por dashboard solo si la llave es válida."""
+    if validate_dashboard_proxy_key():
+        forwarded_ip = request.headers.get("X-Dashboard-Source-IP", "").strip()
+
+        if forwarded_ip:
+            return safe_log_value(forwarded_ip, limit=64)
+
+    return request_source_ip()
+
+
 def get_current_user_from_token():
-    """Return authenticated user from Bearer token or an error response."""
+    """Retornar usuario autenticado por JWT o por proxy interno del dashboard."""
+    dashboard_user = get_dashboard_proxy_user()
+
+    if dashboard_user:
+        return dashboard_user, None
+
     token = get_bearer_token()
 
     if not token:
@@ -510,6 +561,80 @@ def serialize_security_event(security_event):
             else None
         ),
     }
+
+
+def record_privileged_action(
+    action,
+    resource_type,
+    resource_id=None,
+    changed_fields=None,
+    affected_count=None,
+    **metadata,
+):
+    """Registrar una acción administrativa exitosa sin guardar payloads."""
+    actor = getattr(request, "current_user", None)
+
+    if not actor:
+        logger.error(
+            "event=privileged_audit_missing_actor action=%s resource_type=%s",
+            safe_log_value(action, limit=80),
+            safe_log_value(resource_type, limit=50),
+        )
+        return None
+
+    normalized_fields = []
+
+    if changed_fields:
+        normalized_fields = sorted({
+            safe_log_value(field, limit=64)
+            for field in changed_fields
+            if field
+        })
+
+    details = {
+        "action": safe_log_value(action, limit=80),
+        "resource_type": safe_log_value(resource_type, limit=50),
+        "resource_id": (
+            safe_log_value(resource_id, limit=80)
+            if resource_id is not None
+            else "none"
+        ),
+        "actor_user_id": actor.id,
+        "actor_role": safe_log_value(actor.role, limit=32),
+        "outcome": "success",
+        "http_method": request.method,
+        "route": safe_log_value(request.path, limit=120),
+    }
+
+    if normalized_fields:
+        details["changed_fields"] = ",".join(normalized_fields)
+
+    if affected_count is not None:
+        details["affected_count"] = affected_count
+
+    details.update(metadata)
+
+    security_event = record_security_event(
+        event_type="privileged_action",
+        severity="info",
+        source="api",
+        source_ip=request_audit_source_ip(),
+        actor_username=actor.username,
+        **details,
+    )
+
+    if security_event:
+        logger.info(
+            "event=privileged_action_audited action=%s resource_type=%s "
+            "resource_id=%s actor_user_id=%s actor_role=%s",
+            details["action"],
+            details["resource_type"],
+            details["resource_id"],
+            actor.id,
+            details["actor_role"],
+        )
+
+    return security_event
 
 
 def normalize_login_username(username):
@@ -1367,6 +1492,7 @@ def verify_auth_token():
 def user_detail(user_id):
     try:
         user = User.query.get(user_id)
+
         if not user:
             return jsonify({'error': 'User not found'}), 404
 
@@ -1379,25 +1505,131 @@ def user_detail(user_id):
                 'initials': user.initials,
                 'profile_image_url': user.profile_image_url
             })
-        
-        if request.method == 'PUT':
-            current_role = normalize_role(request.current_user.role)
-            if current_role != "admin":
-                return jsonify({
-                    "error": "Permisos insuficientes.",
-                    "details": ["Solo un administrador puede modificar usuarios."]
-                }), 403
-            data = request.get_json()
-            if 'full_name' in data: user.full_name = data['full_name']
-            if 'role' in data: user.role = data['role']
-            if 'initials' in data: user.initials = data['initials']
-            if 'profile_image_url' in data: user.profile_image_url = data['profile_image_url']
-            
-            db.session.commit()
-            return jsonify({'msg': 'User updated successfully'})
 
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        actor = request.current_user
+        actor_role = normalize_role(actor.role)
+        is_self_update = actor.id == user.id
+
+        if not is_self_update and actor_role != 'admin':
+            return jsonify({
+                'error': 'Permisos insuficientes.',
+                'details': [
+                    'Solo un administrador puede modificar otros usuarios.'
+                ]
+            }), 403
+
+        data = request.get_json(silent=True) or {}
+
+        if not isinstance(data, dict):
+            return jsonify({
+                'error': 'Datos de usuario inválidos'
+            }), 400
+
+        allowed_fields = {
+            'full_name',
+            'initials',
+            'profile_image_url',
+            'role',
+        }
+
+        invalid_fields = set(data) - allowed_fields
+        if invalid_fields:
+            return jsonify({
+                'error': 'Solicitud contiene campos no permitidos.'
+            }), 400
+
+        changed_fields = []
+
+        for field, max_length in (
+            ('full_name', 120),
+            ('initials', 10),
+            ('profile_image_url', 500),
+        ):
+            if field not in data:
+                continue
+
+            value = data[field]
+
+            if not isinstance(value, str):
+                return jsonify({
+                    'error': f'El campo {field} debe ser texto.'
+                }), 400
+
+            value = value.strip()
+
+            if len(value) > max_length:
+                return jsonify({
+                    'error': f'El campo {field} excede la longitud permitida.'
+                }), 400
+
+            if getattr(user, field) != value:
+                setattr(user, field, value)
+                changed_fields.append(field)
+
+        if 'role' in data:
+            if actor_role != 'admin':
+                return jsonify({
+                    'error': 'Permisos insuficientes.',
+                    'details': [
+                        'Solo un administrador puede cambiar roles.'
+                    ]
+                }), 403
+
+            if is_self_update:
+                return jsonify({
+                    'error': 'No puedes cambiar tu propio rol desde el perfil.'
+                }), 403
+
+            requested_role = str(data['role']).strip().lower()
+
+            valid_roles = {
+                'admin': 'admin',
+                'user': 'User',
+            }
+
+            if requested_role not in valid_roles:
+                return jsonify({
+                    'error': 'Rol inválido.'
+                }), 400
+
+            new_role = valid_roles[requested_role]
+
+            if user.role != new_role:
+                user.role = new_role
+                changed_fields.append('role')
+
+        if not changed_fields:
+            return jsonify({
+                'msg': 'No changes detected'
+            }), 200
+
+        db.session.commit()
+
+        record_privileged_action(
+            action='user_updated',
+            resource_type='user',
+            resource_id=user.id,
+            changed_fields=changed_fields,
+            target_username=safe_log_value(
+                user.username,
+                limit=80,
+            ),
+        )
+
+        return jsonify({
+            'msg': 'User updated successfully'
+        })
+
+    except Exception:
+        db.session.rollback()
+        logger.exception(
+            'event=user_update_failed user_id=%s source_ip=%s',
+            user_id,
+            request_audit_source_ip(),
+        )
+        return jsonify({
+            'error': 'Error interno al actualizar usuario.'
+        }), 500
 
 # Thresholds Endpoints
 @app.route('/api/umbrales', methods=['GET'])
@@ -1420,22 +1652,47 @@ def get_umbrales():
 @auth_required(roles=["admin", "operador"])
 def update_umbrales():
     try:
-        data = request.get_json()
-        
+        data = request.get_json(silent=True)
+
+        if not isinstance(data, list) or not data:
+            return jsonify({
+                'error': 'Se requiere una lista de umbrales.'
+            }), 400
+
+        updated_variables = []
+
         for item in data:
-            variable    = item['variable']
-            valor_medio = float(item['valor_medio'])
-            valor_alto  = float(item['valor_alto'])
-            valor_grave = float(item['valor_grave'])
+            if not isinstance(item, dict):
+                return jsonify({
+                    'error': 'Cada umbral debe ser un objeto válido.'
+                }), 400
+
+            try:
+                variable = str(item['variable']).strip()
+                valor_medio = float(item['valor_medio'])
+                valor_alto = float(item['valor_alto'])
+                valor_grave = float(item['valor_grave'])
+            except (KeyError, TypeError, ValueError):
+                return jsonify({
+                    'error': 'Datos de umbral inválidos.'
+                }), 400
+
+            if not variable:
+                return jsonify({
+                    'error': 'La variable del umbral es requerida.'
+                }), 400
 
             if not (valor_medio < valor_alto < valor_grave):
                 return jsonify({
-                    'error': f"Umbrales inválidos para '{variable}': "
-                             f"debe cumplirse medio ({valor_medio}) < alto ({valor_alto}) < grave ({valor_grave})"
+                    'error': (
+                        f"Umbrales inválidos para '{variable}': "
+                        f"debe cumplirse medio ({valor_medio}) < "
+                        f"alto ({valor_alto}) < grave ({valor_grave})"
+                    )
                 }), 400
 
-            # Update or create
             umbral = Umbral.query.filter_by(variable=variable).first()
+
             if umbral:
                 umbral.valor_medio = valor_medio
                 umbral.valor_alto = valor_alto
@@ -1445,70 +1702,118 @@ def update_umbrales():
                     variable=variable,
                     valor_medio=valor_medio,
                     valor_alto=valor_alto,
-                    valor_grave=valor_grave
+                    valor_grave=valor_grave,
                 )
                 db.session.add(umbral)
-        
+
+            updated_variables.append(variable)
+
         db.session.commit()
+
         logger.info(
             "event=thresholds_updated actor_user_id=%s actor_role=%s "
             "updated_count=%s source_ip=%s",
             request.current_user.id,
             safe_log_value(request.current_user.role, limit=32),
-            len(data),
-            request_source_ip(),
+            len(updated_variables),
+            request_audit_source_ip(),
         )
-        return jsonify({'message': 'Thresholds updated successfully'}), 200
+
+        record_privileged_action(
+            action='thresholds_updated',
+            resource_type='threshold_set',
+            resource_id='global',
+            changed_fields=[
+                'valor_medio',
+                'valor_alto',
+                'valor_grave',
+            ],
+            affected_count=len(updated_variables),
+            variables=','.join(sorted({
+                safe_log_value(variable, limit=50)
+                for variable in updated_variables
+            })),
+        )
+
+        return jsonify({
+            'message': 'Thresholds updated successfully'
+        }), 200
+
     except Exception:
         db.session.rollback()
         logger.exception(
             "event=thresholds_update_failed actor_user_id=%s source_ip=%s",
             getattr(getattr(request, "current_user", None), "id", "-"),
-            request_source_ip(),
+            request_audit_source_ip(),
         )
-        return jsonify({'error': 'Error interno al actualizar umbrales.'}), 500
+        return jsonify({
+            'error': 'Error interno al actualizar umbrales.'
+        }), 500
 
 @app.route('/api/umbrales/init', methods=['POST'])
 @auth_required(roles=["admin"])
 def init_umbrales():
-    """Initialize default thresholds only if they don't exist"""
+    """Inicializar umbrales predeterminados solo cuando no existen."""
     try:
-        # Check if thresholds already exist
         existing_count = Umbral.query.count()
+
         if existing_count > 0:
             return jsonify({
                 'message': f'Thresholds already exist ({existing_count} records)',
                 'action': 'none'
             }), 200
-        
-        # Default thresholds
+
         default_umbrales = [
             {'variable': 'temperatura', 'valor_medio': 25.0, 'valor_alto': 30.0, 'valor_grave': 35.0},
             {'variable': 'humedad', 'valor_medio': 60.0, 'valor_alto': 75.0, 'valor_grave': 85.0},
             {'variable': 'amoniaco', 'valor_medio': 20.0, 'valor_alto': 30.0, 'valor_grave': 40.0},
             {'variable': 'co2', 'valor_medio': 1000.0, 'valor_alto': 1500.0, 'valor_grave': 2000.0},
-            {'variable': 'co', 'valor_medio': 10.0, 'valor_alto': 20.0, 'valor_grave': 30.0}
+            {'variable': 'co', 'valor_medio': 10.0, 'valor_alto': 20.0, 'valor_grave': 30.0},
         ]
-        
+
         for item in default_umbrales:
-            umbral = Umbral(
+            db.session.add(Umbral(
                 variable=item['variable'],
                 valor_medio=item['valor_medio'],
                 valor_alto=item['valor_alto'],
-                valor_grave=item['valor_grave']
-            )
-            db.session.add(umbral)
-        
+                valor_grave=item['valor_grave'],
+            ))
+
         db.session.commit()
+
+        record_privileged_action(
+            action='thresholds_initialized',
+            resource_type='threshold_set',
+            resource_id='global',
+            changed_fields=[
+                'valor_medio',
+                'valor_alto',
+                'valor_grave',
+            ],
+            affected_count=len(default_umbrales),
+            initialization='default_values',
+            variables=','.join(
+                item['variable']
+                for item in default_umbrales
+            ),
+        )
+
         return jsonify({
             'message': f'Default thresholds created ({len(default_umbrales)} records)',
             'action': 'created',
             'count': len(default_umbrales)
         }), 201
-        
-    except Exception as e:
+
+    except Exception:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        logger.exception(
+            "event=thresholds_initialization_failed actor_user_id=%s source_ip=%s",
+            getattr(getattr(request, "current_user", None), "id", "-"),
+            request_audit_source_ip(),
+        )
+        return jsonify({
+            'error': 'Error interno al inicializar umbrales.'
+        }), 500
 
 
 
@@ -1603,25 +1908,48 @@ def get_alerts():
 @app.route('/api/alerts/<int:alert_id>', methods=['PUT'])
 @auth_required(roles=["admin", "operador"])
 def update_alert(alert_id):
-    """Update alert status"""
     try:
         alert = Alerta.query.get_or_404(alert_id)
-        data = request.get_json()
-        
+        data = request.get_json(silent=True) or {}
+
+        if not isinstance(data, dict):
+            return jsonify({
+                'error': 'Datos de alerta inválidos.'
+            }), 400
+
+        changed_fields = []
+
         if 'estado' in data:
             alert.estado = data['estado']
+            changed_fields.append('estado')
+
             if data['estado'] == 'resolved':
                 alert.timestamp_resuelto = datetime.utcnow()
-        
+                changed_fields.append('timestamp_resuelto')
+
         db.session.commit()
+
+        if changed_fields:
+            record_privileged_action(
+                action='alert_updated',
+                resource_type='alert',
+                resource_id=alert.id,
+                changed_fields=changed_fields,
+            )
+
         return jsonify({'message': 'Alert updated successfully'})
-    except Exception as e:
+
+    except Exception:
+        db.session.rollback()
         logger.exception(
-        "event=alert_update_failed alert_id=%s source_ip=%s",
-        alert_id,
-        request_source_ip(),
+            "event=alert_update_failed alert_id=%s source_ip=%s",
+            alert_id,
+            request_audit_source_ip(),
         )
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'error': 'Error interno al actualizar alerta.'
+        }), 500
+
 
 @app.route('/api/alerts/stats', methods=['GET'])
 def get_alert_stats():
@@ -1648,50 +1976,92 @@ def get_alert_stats():
 @app.route('/api/alerts/mark-all', methods=['PUT'])
 @auth_required(roles=["admin", "operador"])
 def mark_all_alerts():
-    """Mark all active alerts as acknowledged"""
     try:
         alerts = Alerta.query.filter_by(estado='active').all()
+
         for alert in alerts:
             alert.estado = 'acknowledged'
-        
+
         db.session.commit()
-        return jsonify({'message': f'Marked {len(alerts)} alerts as acknowledged'})
-    except Exception as e:
-        logger.exception(
-        "event=alerts_mark_all_failed source_ip=%s",
-        request_source_ip(),
+
+        record_privileged_action(
+            action='alerts_acknowledged_bulk',
+            resource_type='alert',
+            resource_id='all_active',
+            changed_fields=['estado'],
+            affected_count=len(alerts),
         )
-        return jsonify({'error': str(e)}), 500
+
+        return jsonify({
+            'message': f'Marked {len(alerts)} alerts as acknowledged'
+        })
+
+    except Exception:
+        db.session.rollback()
+        logger.exception(
+            "event=alerts_mark_all_failed source_ip=%s",
+            request_audit_source_ip(),
+        )
+        return jsonify({
+            'error': 'Error interno al reconocer alertas.'
+        }), 500
+
 
 @app.route('/api/alerts/all', methods=['DELETE'])
 @auth_required(roles=["admin"])
 def delete_all_alerts():
-    """Delete all alerts"""
     try:
         num_deleted = db.session.query(Alerta).delete()
         db.session.commit()
-        return jsonify({'message': f'Se eliminaron {num_deleted} alertas correctamente'})
-    except Exception as e:
-        logger.exception(
-        "event=alerts_delete_all_failed source_ip=%s",
-        request_source_ip(),
+
+        record_privileged_action(
+            action='alerts_deleted_bulk',
+            resource_type='alert',
+            resource_id='all',
+            affected_count=num_deleted,
         )
+
+        return jsonify({
+            'message': f'Se eliminaron {num_deleted} alertas correctamente'
+        })
+
+    except Exception:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        logger.exception(
+            "event=alerts_delete_all_failed source_ip=%s",
+            request_audit_source_ip(),
+        )
+        return jsonify({
+            'error': 'Error interno al eliminar alertas.'
+        }), 500
+
 
 @app.route('/api/alerts/check', methods=['POST'])
 @auth_required(roles=["admin", "operador"])
 def trigger_alert_check():
-    """Manually trigger alert creation from existing data"""
     try:
         check_and_create_alerts()
-        return jsonify({'message': 'Alert check completed successfully'})
-    except Exception as e:
-        logger.exception(
-        "event=alerts_check_failed source_ip=%s",
-        request_source_ip(),
+
+        record_privileged_action(
+            action='alerts_check_triggered',
+            resource_type='alert_engine',
+            resource_id='manual_check',
         )
-        return jsonify({'error': str(e)}), 500
+
+        return jsonify({
+            'message': 'Alert check completed successfully'
+        })
+
+    except Exception:
+        db.session.rollback()
+        logger.exception(
+            "event=alerts_check_failed source_ip=%s",
+            request_audit_source_ip(),
+        )
+        return jsonify({
+            'error': 'Error interno al ejecutar revisión de alertas.'
+        }), 500
+
 
 # -------------------------------------------------------
 # Eventos de seguridad
@@ -1813,46 +2183,104 @@ def get_granjas():
 @auth_required(roles=["admin"])
 def create_granja():
     try:
-        data = request.get_json()
-        if not data or not data.get('nombre'):
+        data = request.get_json(silent=True) or {}
+
+        if not isinstance(data, dict) or not data.get('nombre'):
             return jsonify({'error': 'nombre is required'}), 400
-        granja = Granja(nombre=data['nombre'], ubicacion=data.get('ubicacion'))
+
+        granja = Granja(
+            nombre=data['nombre'],
+            ubicacion=data.get('ubicacion'),
+        )
         db.session.add(granja)
         db.session.commit()
-        return jsonify({'id': granja.id, 'nombre': granja.nombre}), 201
+
+        changed_fields = ['nombre']
+
+        if 'ubicacion' in data:
+            changed_fields.append('ubicacion')
+
+        record_privileged_action(
+            action='farm_created',
+            resource_type='farm',
+            resource_id=granja.id,
+            changed_fields=changed_fields,
+        )
+
+        return jsonify({
+            'id': granja.id,
+            'nombre': granja.nombre
+        }), 201
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/granjas/<int:granja_id>', methods=['PUT'])
 @auth_required(roles=["admin"])
 def update_granja(granja_id):
     try:
         granja = Granja.query.get_or_404(granja_id)
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
+
+        if not isinstance(data, dict):
+            return jsonify({'error': 'Datos de granja inválidos'}), 400
+
+        changed_fields = []
+
         if 'nombre' in data:
             granja.nombre = data['nombre']
+            changed_fields.append('nombre')
+
         if 'ubicacion' in data:
             granja.ubicacion = data['ubicacion']
+            changed_fields.append('ubicacion')
+
         db.session.commit()
+
+        if changed_fields:
+            record_privileged_action(
+                action='farm_updated',
+                resource_type='farm',
+                resource_id=granja.id,
+                changed_fields=changed_fields,
+            )
+
         return jsonify({'msg': 'Granja actualizada'})
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/granjas/<int:granja_id>', methods=['DELETE'])
 @auth_required(roles=["admin"])
 def delete_granja(granja_id):
     try:
         granja = Granja.query.get_or_404(granja_id)
+
         if granja.naves:
-            return jsonify({'error': 'No se puede eliminar: tiene naves asociadas'}), 409
+            return jsonify({
+                'error': 'No se puede eliminar: tiene naves asociadas'
+            }), 409
+
+        deleted_id = granja.id
         db.session.delete(granja)
         db.session.commit()
+
+        record_privileged_action(
+            action='farm_deleted',
+            resource_type='farm',
+            resource_id=deleted_id,
+        )
+
         return jsonify({'msg': 'Granja eliminada'})
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
 
 # -------------------------------------------------------
 # Naves CRUD
@@ -1886,60 +2314,132 @@ def get_naves():
 @auth_required(roles=["admin"])
 def create_nave():
     try:
-        data = request.get_json()
-        if not data or not data.get('nombre') or not data.get('granja_id'):
-            return jsonify({'error': 'nombre y granja_id son requeridos'}), 400
+        data = request.get_json(silent=True) or {}
+
+        if (
+            not isinstance(data, dict)
+            or not data.get('nombre')
+            or not data.get('granja_id')
+        ):
+            return jsonify({
+                'error': 'nombre y granja_id son requeridos'
+            }), 400
+
         fecha = None
+
         if data.get('fecha_inicio_parvada'):
             from datetime import date as date_type
             fecha = date_type.fromisoformat(data['fecha_inicio_parvada'])
+
         nave = Nave(
             nombre=data['nombre'],
             granja_id=data['granja_id'],
-            fecha_inicio_parvada=fecha
+            fecha_inicio_parvada=fecha,
         )
         db.session.add(nave)
         db.session.commit()
-        return jsonify({'id': nave.id, 'nombre': nave.nombre}), 201
+
+        changed_fields = ['nombre', 'granja_id']
+
+        if 'fecha_inicio_parvada' in data:
+            changed_fields.append('fecha_inicio_parvada')
+
+        record_privileged_action(
+            action='house_created',
+            resource_type='house',
+            resource_id=nave.id,
+            changed_fields=changed_fields,
+            parent_farm_id=nave.granja_id,
+        )
+
+        return jsonify({
+            'id': nave.id,
+            'nombre': nave.nombre
+        }), 201
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/naves/<int:nave_id>', methods=['PUT'])
 @auth_required(roles=["admin"])
 def update_nave(nave_id):
     try:
         nave = Nave.query.get_or_404(nave_id)
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
+
+        if not isinstance(data, dict):
+            return jsonify({'error': 'Datos de nave inválidos'}), 400
+
+        changed_fields = []
+
         if 'nombre' in data:
             nave.nombre = data['nombre']
+            changed_fields.append('nombre')
+
         if 'granja_id' in data:
             nave.granja_id = data['granja_id']
+            changed_fields.append('granja_id')
+
         if 'fecha_inicio_parvada' in data:
-            if data['fecha_inicio_parvada']:
-                from datetime import date as date_type
-                nave.fecha_inicio_parvada = date_type.fromisoformat(data['fecha_inicio_parvada'])
-            else:
-                nave.fecha_inicio_parvada = None
+            from datetime import date as date_type
+
+            nave.fecha_inicio_parvada = (
+                date_type.fromisoformat(data['fecha_inicio_parvada'])
+                if data['fecha_inicio_parvada']
+                else None
+            )
+            changed_fields.append('fecha_inicio_parvada')
+
         db.session.commit()
+
+        if changed_fields:
+            record_privileged_action(
+                action='house_updated',
+                resource_type='house',
+                resource_id=nave.id,
+                changed_fields=changed_fields,
+                parent_farm_id=nave.granja_id,
+            )
+
         return jsonify({'msg': 'Nave actualizada'})
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/naves/<int:nave_id>', methods=['DELETE'])
 @auth_required(roles=["admin"])
 def delete_nave(nave_id):
     try:
         nave = Nave.query.get_or_404(nave_id)
+
         if nave.modulos:
-            return jsonify({'error': 'No se puede eliminar: tiene módulos asociados'}), 409
+            return jsonify({
+                'error': 'No se puede eliminar: tiene módulos asociados'
+            }), 409
+
+        deleted_id = nave.id
+        parent_farm_id = nave.granja_id
+
         db.session.delete(nave)
         db.session.commit()
+
+        record_privileged_action(
+            action='house_deleted',
+            resource_type='house',
+            resource_id=deleted_id,
+            parent_farm_id=parent_farm_id,
+        )
+
         return jsonify({'msg': 'Nave eliminada'})
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
 
 # -------------------------------------------------------
 # Módulos registry
@@ -1985,20 +2485,48 @@ def get_modulos():
 @auth_required(roles=["admin", "operador"])
 def update_modulo(codigo):
     try:
-        data = request.get_json()
-        m = Modulo.query.filter_by(codigo=codigo).first()
-        if not m:
-            m = Modulo(codigo=codigo)
-            db.session.add(m)
+        data = request.get_json(silent=True) or {}
+
+        if not isinstance(data, dict):
+            return jsonify({'error': 'Datos de módulo inválidos'}), 400
+
+        modulo = Modulo.query.filter_by(codigo=codigo).first()
+        created = modulo is None
+
+        if created:
+            modulo = Modulo(codigo=codigo)
+            db.session.add(modulo)
+
+        changed_fields = ['codigo'] if created else []
+
         if 'nave_id' in data:
-            m.nave_id = data['nave_id']
+            modulo.nave_id = data['nave_id']
+            changed_fields.append('nave_id')
+
         if 'nombre' in data:
-            m.nombre = data['nombre']
+            modulo.nombre = data['nombre']
+            changed_fields.append('nombre')
+
         db.session.commit()
-        return jsonify({'msg': 'Módulo actualizado', 'codigo': codigo})
+
+        if changed_fields:
+            record_privileged_action(
+                action='module_created' if created else 'module_updated',
+                resource_type='module',
+                resource_id=codigo,
+                changed_fields=changed_fields,
+                parent_house_id=modulo.nave_id,
+            )
+
+        return jsonify({
+            'msg': 'Módulo actualizado',
+            'codigo': codigo
+        })
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
 
 # -------------------------------------------------------
 # Parvada lookup

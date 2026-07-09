@@ -191,7 +191,7 @@
   let allData = [];
   let filteredData = [];
   let thresholds = {};
-  const API_BASE = `${window.location.protocol}//${window.location.hostname}:5000`;
+  const API_BASE = window.location.origin;
 
   async function populateHouseSelect() {
     try {
@@ -239,7 +239,7 @@
     const house = document.getElementById('houseSelect').value;
     const range = document.getElementById('dateRange').value;
     const parameter = document.getElementById('parameterFilter').value;
-    let url = `${window.location.protocol}//${window.location.hostname}:5000/api/historical?range=${range}`;
+    let url = `${window.location.origin}/api/historical?range=${range}`;
 
     if (house !== 'all') url += `&modulo=${house}`;
     if (parameter !== 'all') url += `&parameter=${parameter}`;
