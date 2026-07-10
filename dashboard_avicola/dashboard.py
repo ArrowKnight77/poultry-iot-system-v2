@@ -460,6 +460,7 @@ def _proxy_json_response(response):
         }), response.status_code
 
 
+@app.route('/dashboard-api/user/<int:user_id>', methods=['GET', 'PUT'])
 @app.route('/api/user/<int:user_id>', methods=['GET', 'PUT'])
 @login_required
 def proxy_user(user_id):

@@ -395,7 +395,7 @@
       }
 
       try {
-        const res = await fetch(`${getBaseUrl()}/api/user/${currentUser.id}`, {
+        const res = await fetch(`${getBaseUrl()}/dashboard-api/user/${currentUser.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(updates)
