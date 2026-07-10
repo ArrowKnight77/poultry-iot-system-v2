@@ -205,6 +205,57 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 
+PASSWORD_HASH_METHOD = "scrypt"
+PASSWORD_HASH_SALT_LENGTH = 16
+CURRENT_PASSWORD_HASH_PREFIX = "scrypt:"
+SUPPORTED_PASSWORD_HASH_PREFIXES = ("scrypt:", "pbkdf2:")
+
+
+def generate_secure_password_hash(password):
+    """Generar hashes nuevos con un metodo fuerte y explicito."""
+    return generate_password_hash(
+        password,
+        method=PASSWORD_HASH_METHOD,
+        salt_length=PASSWORD_HASH_SALT_LENGTH,
+    )
+
+
+def password_hash_scheme(password_hash):
+    """Identificar el esquema sin exponer el hash completo."""
+    if not isinstance(password_hash, str) or not password_hash:
+        return "missing"
+
+    return password_hash.split("$", 1)[0]
+
+
+def is_supported_password_hash(password_hash):
+    """Aceptar solo formatos de Werkzeug, nunca texto plano."""
+    if not isinstance(password_hash, str):
+        return False
+
+    if password_hash != password_hash.strip() or any(
+        char.isspace()
+        for char in password_hash
+    ):
+        return False
+
+    if not password_hash.startswith(SUPPORTED_PASSWORD_HASH_PREFIXES):
+        return False
+
+    return password_hash.count("$") >= 2
+
+
+def verify_password_hash(password_hash, password):
+    """Verificar solo hashes reconocidos para evitar aceptar texto plano."""
+    if not is_supported_password_hash(password_hash):
+        return False
+
+    try:
+        return check_password_hash(password_hash, password)
+    except (TypeError, ValueError):
+        return False
+
+
 class Lectura(db.Model):
     __tablename__ = 'lecturas'
     id_lectura = db.Column(db.String, primary_key=True)
@@ -221,19 +272,31 @@ class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)
+    password_hash = db.Column(db.String(512), nullable=False)
     full_name = db.Column(db.String(120))
     role = db.Column(db.String(50))
     initials = db.Column(db.String(10))
     profile_image_url = db.Column(db.String(500))
     
     def set_password(self, password):
-        """Hash the password and store it"""
-        self.password_hash = generate_password_hash(password)
+        """Hash the password and store it."""
+        self.password_hash = generate_secure_password_hash(password)
     
     def check_password(self, password):
-        """Check if the provided password matches the hash"""
-        return check_password_hash(self.password_hash, password)
+        """Check if the provided password matches a supported hash."""
+        return verify_password_hash(self.password_hash, password)
+
+    def has_supported_password_hash(self):
+        return is_supported_password_hash(self.password_hash)
+
+    def password_hash_needs_migration(self):
+        return (
+            self.has_supported_password_hash()
+            and not self.password_hash.startswith(CURRENT_PASSWORD_HASH_PREFIX)
+        )
+
+    def password_hash_scheme(self):
+        return password_hash_scheme(self.password_hash)
 
 
 class LoginLockout(db.Model):
@@ -635,6 +698,35 @@ def record_privileged_action(
         )
 
     return security_event
+
+
+def migrate_user_password_hash_if_needed(user, password, source_ip):
+    """Rehashear hashes soportados pero antiguos tras un login valido."""
+    if not user.password_hash_needs_migration():
+        return False
+
+    old_scheme = safe_log_value(user.password_hash_scheme(), limit=64)
+    user.set_password(password)
+    db.session.commit()
+
+    logger.info(
+        "event=password_hash_migrated user_id=%s old_hash_scheme=%s "
+        "new_hash_scheme=%s source_ip=%s",
+        user.id,
+        old_scheme,
+        PASSWORD_HASH_METHOD,
+        source_ip,
+    )
+    record_security_event(
+        event_type="password_hash_migrated",
+        severity="info",
+        source="api",
+        source_ip=source_ip,
+        actor_username=user.username,
+        old_hash_scheme=old_scheme,
+        new_hash_scheme=PASSWORD_HASH_METHOD,
+    )
+    return True
 
 
 def normalize_login_username(username):
@@ -1381,7 +1473,26 @@ def login_user():
 
         user = User.query.filter_by(username=username).first()
 
+        if user and not user.has_supported_password_hash():
+            logger.error(
+                "event=password_hash_unsupported user_id=%s "
+                "hash_scheme=%s source_ip=%s",
+                user.id,
+                safe_log_value(user.password_hash_scheme(), limit=64),
+                source_ip,
+            )
+            record_security_event(
+                event_type="password_hash_unsupported",
+                severity="error",
+                source="api",
+                source_ip=source_ip,
+                actor_username=username,
+                reason="unsupported_hash_scheme",
+                hash_scheme=user.password_hash_scheme(),
+            )
+
         if user and user.check_password(password):
+            migrate_user_password_hash_if_needed(user, password, source_ip)
             clear_login_lockout(lockout_username)
 
             access_token = generate_jwt_token(user)

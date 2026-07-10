@@ -38,6 +38,46 @@ def add_security_headers(response):
     return response
 
 db = SQLAlchemy(app)
+
+PASSWORD_HASH_METHOD = "scrypt"
+PASSWORD_HASH_SALT_LENGTH = 16
+SUPPORTED_PASSWORD_HASH_PREFIXES = ("scrypt:", "pbkdf2:")
+
+
+def generate_secure_password_hash(password):
+    return generate_password_hash(
+        password,
+        method=PASSWORD_HASH_METHOD,
+        salt_length=PASSWORD_HASH_SALT_LENGTH,
+    )
+
+
+def is_supported_password_hash(password_hash):
+    if not isinstance(password_hash, str):
+        return False
+
+    if password_hash != password_hash.strip() or any(
+        char.isspace()
+        for char in password_hash
+    ):
+        return False
+
+    if not password_hash.startswith(SUPPORTED_PASSWORD_HASH_PREFIXES):
+        return False
+
+    return password_hash.count("$") >= 2
+
+
+def verify_password_hash(password_hash, password):
+    if not is_supported_password_hash(password_hash):
+        return False
+
+    try:
+        return check_password_hash(password_hash, password)
+    except (TypeError, ValueError):
+        return False
+
+
 dashboard_cors_origins_raw = os.getenv(
     "DASHBOARD_CORS_ORIGINS",
     "http://localhost:5000,http://localhost:5001"
@@ -64,19 +104,19 @@ class User(UserMixin, db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)
+    password_hash = db.Column(db.String(512), nullable=False)
     full_name = db.Column(db.String(120))
     role = db.Column(db.String(50))
     initials = db.Column(db.String(10))
     profile_image_url = db.Column(db.String(500))
     
     def set_password(self, password):
-        """Hash the password and store it"""
-        self.password_hash = generate_password_hash(password)
+        """Hash the password and store it."""
+        self.password_hash = generate_secure_password_hash(password)
     
     def check_password(self, password):
-        """Check if the provided password matches the hash"""
-        return check_password_hash(self.password_hash, password)
+        """Check if the provided password matches a supported hash."""
+        return verify_password_hash(self.password_hash, password)
 
 # No crear usuarios automáticamente
 # El primer usuario debe registrarse manualmente
@@ -794,5 +834,4 @@ def start(port=5001, host='0.0.0.0'):
 
 if __name__ == '__main__':
     start()
-
 
