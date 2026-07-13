@@ -42,6 +42,19 @@ db = SQLAlchemy(app)
 PASSWORD_HASH_METHOD = "scrypt"
 PASSWORD_HASH_SALT_LENGTH = 16
 SUPPORTED_PASSWORD_HASH_PREFIXES = ("scrypt:", "pbkdf2:")
+CANONICAL_ROLES = ("admin", "operador", "visor")
+DEFAULT_USER_ROLE = "visor"
+ROLE_ALIASES = {
+    "admin": "admin",
+    "administrator": "admin",
+    "administrador": "admin",
+    "operador": "operador",
+    "operator": "operador",
+    "visor": "visor",
+    "viewer": "visor",
+    "user": "visor",
+    "usuario": "visor",
+}
 
 
 def generate_secure_password_hash(password):
@@ -78,6 +91,15 @@ def verify_password_hash(password_hash, password):
         return False
 
 
+def normalize_role(role):
+    raw_role = (role or "").strip().casefold()
+
+    if not raw_role:
+        return DEFAULT_USER_ROLE
+
+    return ROLE_ALIASES.get(raw_role, DEFAULT_USER_ROLE)
+
+
 dashboard_cors_origins_raw = os.getenv(
     "DASHBOARD_CORS_ORIGINS",
     "http://localhost:5000,http://localhost:5001"
@@ -106,7 +128,11 @@ class User(UserMixin, db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(512), nullable=False)
     full_name = db.Column(db.String(120))
-    role = db.Column(db.String(50))
+    role = db.Column(
+        db.String(20),
+        nullable=False,
+        default=DEFAULT_USER_ROLE,
+    )
     initials = db.Column(db.String(10))
     profile_image_url = db.Column(db.String(500))
     
@@ -117,6 +143,9 @@ class User(UserMixin, db.Model):
     def check_password(self, password):
         """Check if the provided password matches a supported hash."""
         return verify_password_hash(self.password_hash, password)
+
+    def normalized_role(self):
+        return normalize_role(self.role)
 
 # No crear usuarios automáticamente
 # El primer usuario debe registrarse manualmente
@@ -307,7 +336,7 @@ def register():
             # Crear usuario
             username = request.form['username']
             full_name = request.form['full_name']
-            role = request.form.get('role', 'User')
+            role = normalize_role(request.form.get('role'))
             
             # Generar iniciales
             initials = ''.join([n[0].upper() for n in full_name.split()])[:2]
@@ -375,7 +404,7 @@ def dashboard():
         'id': current_user.id,
         'username': current_user.username,
         'full_name': current_user.full_name,
-        'role': current_user.role,
+        'role': current_user.normalized_role(),
         'initials': current_user.initials,
         'profile_image_url': current_user.profile_image_url
     }
@@ -754,7 +783,7 @@ def historical():
         'id': current_user.id,
         'username': current_user.username,
         'full_name': current_user.full_name,
-        'role': current_user.role,
+        'role': current_user.normalized_role(),
         'initials': current_user.initials,
         'profile_image_url': current_user.profile_image_url
     }
@@ -767,7 +796,7 @@ def analysis():
         'id': current_user.id,
         'username': current_user.username,
         'full_name': current_user.full_name,
-        'role': current_user.role,
+        'role': current_user.normalized_role(),
         'initials': current_user.initials,
         'profile_image_url': current_user.profile_image_url
     }
@@ -780,7 +809,7 @@ def alerts():
         'id': current_user.id,
         'username': current_user.username,
         'full_name': current_user.full_name,
-        'role': current_user.role,
+        'role': current_user.normalized_role(),
         'initials': current_user.initials,
         'profile_image_url': current_user.profile_image_url
     }
@@ -793,7 +822,7 @@ def devices():
         'id': current_user.id,
         'username': current_user.username,
         'full_name': current_user.full_name,
-        'role': current_user.role,
+        'role': current_user.normalized_role(),
         'initials': current_user.initials,
         'profile_image_url': current_user.profile_image_url
     }
@@ -806,7 +835,7 @@ def ml_models():
         'id': current_user.id,
         'username': current_user.username,
         'full_name': current_user.full_name,
-        'role': current_user.role,
+        'role': current_user.normalized_role(),
         'initials': current_user.initials,
         'profile_image_url': current_user.profile_image_url
     }
@@ -819,7 +848,7 @@ def reports():
         'id': current_user.id,
         'username': current_user.username,
         'full_name': current_user.full_name,
-        'role': current_user.role,
+        'role': current_user.normalized_role(),
         'initials': current_user.initials,
         'profile_image_url': current_user.profile_image_url
     }
@@ -835,4 +864,3 @@ def start(port=5001, host='0.0.0.0'):
 
 if __name__ == '__main__':
     start()
-

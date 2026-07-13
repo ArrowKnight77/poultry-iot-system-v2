@@ -225,7 +225,8 @@
             <label class="form-label" data-i18n="profile.role">Rol</label>
             <select class="form-select" id="editRole" disabled>
               <option value="admin">Administrador</option>
-              <option value="User">Usuario</option>
+              <option value="operador">Operador</option>
+              <option value="visor">Visor</option>
             </select>
           </div>
           <div class="mb-3">
@@ -259,7 +260,7 @@
         id: 1,
         username: 'admin',
         full_name: 'Administrator',
-        role: 'Administrator',
+        role: 'admin',
         initials: 'AD',
         profile_image_url: null
     };
@@ -327,7 +328,7 @@
 
     function updateProfileUI(user) {
       const fullName = user.full_name || user.username;
-      const role = user.role || 'User';
+      const role = user.role || 'visor';
 
       document.getElementById('userName').innerText = fullName;
       document.getElementById('userName').title = fullName;
@@ -356,10 +357,9 @@
       const roleSelect = document.getElementById('editRole');
       const normalizedRole = String(currentUser.role || '').trim().toLowerCase();
 
-      roleSelect.value = (
-        normalizedRole === 'admin' ||
-        normalizedRole === 'administrator'
-      ) ? 'admin' : 'User';
+      roleSelect.value = ['admin', 'operador', 'visor'].includes(normalizedRole)
+        ? normalizedRole
+        : 'visor';
 
       // El perfil propio no permite modificar permisos.
       roleSelect.disabled = true;
