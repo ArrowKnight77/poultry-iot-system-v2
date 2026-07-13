@@ -209,6 +209,19 @@ PASSWORD_HASH_METHOD = "scrypt"
 PASSWORD_HASH_SALT_LENGTH = 16
 CURRENT_PASSWORD_HASH_PREFIX = "scrypt:"
 SUPPORTED_PASSWORD_HASH_PREFIXES = ("scrypt:", "pbkdf2:")
+CANONICAL_ROLES = ("admin", "operador", "visor")
+DEFAULT_USER_ROLE = "visor"
+ROLE_ALIASES = {
+    "admin": "admin",
+    "administrator": "admin",
+    "administrador": "admin",
+    "operador": "operador",
+    "operator": "operador",
+    "visor": "visor",
+    "viewer": "visor",
+    "user": "visor",
+    "usuario": "visor",
+}
 
 
 def generate_secure_password_hash(password):
@@ -256,6 +269,16 @@ def verify_password_hash(password_hash, password):
         return False
 
 
+def canonicalize_role(role, default=DEFAULT_USER_ROLE):
+    """Normalizar roles legados al modelo admin/operador/visor."""
+    raw_role = (role or "").strip().casefold()
+
+    if not raw_role:
+        return default
+
+    return ROLE_ALIASES.get(raw_role, default)
+
+
 class Lectura(db.Model):
     __tablename__ = 'lecturas'
     id_lectura = db.Column(db.String, primary_key=True)
@@ -274,7 +297,11 @@ class User(db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(512), nullable=False)
     full_name = db.Column(db.String(120))
-    role = db.Column(db.String(50))
+    role = db.Column(
+        db.String(20),
+        nullable=False,
+        default=DEFAULT_USER_ROLE,
+    )
     initials = db.Column(db.String(10))
     profile_image_url = db.Column(db.String(500))
     
@@ -332,7 +359,7 @@ def serialize_user(user):
         "id": user.id,
         "username": user.username,
         "full_name": user.full_name,
-        "role": user.role,
+        "role": normalize_role(user.role),
         "initials": user.initials,
         "profile_image_url": user.profile_image_url
     }
@@ -346,7 +373,7 @@ def generate_jwt_token(user):
     payload = {
         "sub": str(user.id),
         "username": user.username,
-        "role": user.role,
+        "role": normalize_role(user.role),
         "iat": now,
         "exp": expires_at,
     }
@@ -446,7 +473,7 @@ def get_current_user_from_token():
 
 def normalize_role(role):
     """Normalize role names for RBAC checks."""
-    return (role or "").strip().lower()
+    return canonicalize_role(role)
 
 
 def auth_required(roles=None):
@@ -663,7 +690,7 @@ def record_privileged_action(
             else "none"
         ),
         "actor_user_id": actor.id,
-        "actor_role": safe_log_value(actor.role, limit=32),
+        "actor_role": safe_log_value(normalize_role(actor.role), limit=32),
         "outcome": "success",
         "http_method": request.method,
         "route": safe_log_value(request.path, limit=120),
@@ -1400,14 +1427,20 @@ def historical_data():
 @limiter.limit("5 per hour")  # Restrict registration to prevent spam
 def register_user():
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
+
+        if not isinstance(data, dict):
+            return jsonify({'error': 'JSON inválido o ausente.'}), 400
+
         if User.query.filter_by(username=data['username']).first():
             return jsonify({'error': 'Username already exists'}), 400
+
+        requested_role = canonicalize_role(data.get('role'))
         
         user = User(
             username=data['username'],
             full_name=data.get('full_name', ''),
-            role=data.get('role', 'User'),
+            role=requested_role,
             initials=data.get('initials', ''),
             profile_image_url=data.get('profile_image_url', '')
         )
@@ -1500,7 +1533,7 @@ def login_user():
                 "event=login_succeeded user_id=%s username=%s role=%s source_ip=%s",
                 user.id,
                 safe_log_value(user.username, limit=64),
-                safe_log_value(user.role, limit=32),
+                safe_log_value(normalize_role(user.role), limit=32),
                 source_ip,
             )
 
@@ -1608,14 +1641,7 @@ def user_detail(user_id):
             return jsonify({'error': 'User not found'}), 404
 
         if request.method == 'GET':
-            return jsonify({
-                'id': user.id,
-                'username': user.username,
-                'full_name': user.full_name,
-                'role': user.role,
-                'initials': user.initials,
-                'profile_image_url': user.profile_image_url
-            })
+            return jsonify(serialize_user(user))
 
         actor = request.current_user
         actor_role = normalize_role(actor.role)
@@ -1691,19 +1717,14 @@ def user_detail(user_id):
                     'error': 'No puedes cambiar tu propio rol desde el perfil.'
                 }), 403
 
-            requested_role = str(data['role']).strip().lower()
+            requested_role = canonicalize_role(data['role'], default=None)
 
-            valid_roles = {
-                'admin': 'admin',
-                'user': 'User',
-            }
-
-            if requested_role not in valid_roles:
+            if requested_role not in CANONICAL_ROLES:
                 return jsonify({
                     'error': 'Rol inválido.'
                 }), 400
 
-            new_role = valid_roles[requested_role]
+            new_role = requested_role
 
             if user.role != new_role:
                 user.role = new_role
@@ -1825,7 +1846,7 @@ def update_umbrales():
             "event=thresholds_updated actor_user_id=%s actor_role=%s "
             "updated_count=%s source_ip=%s",
             request.current_user.id,
-            safe_log_value(request.current_user.role, limit=32),
+            safe_log_value(normalize_role(request.current_user.role), limit=32),
             len(updated_variables),
             request_audit_source_ip(),
         )
