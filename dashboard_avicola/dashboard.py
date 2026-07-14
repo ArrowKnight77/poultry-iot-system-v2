@@ -135,6 +135,14 @@ class User(UserMixin, db.Model):
     )
     initials = db.Column(db.String(10))
     profile_image_url = db.Column(db.String(500))
+    mfa_enabled = db.Column(
+        db.Boolean,
+        nullable=False,
+        default=False,
+    )
+    mfa_secret_encrypted = db.Column(db.String(512))
+    mfa_enrolled_at = db.Column(db.DateTime)
+    mfa_last_verified_at = db.Column(db.DateTime)
     
     def set_password(self, password):
         """Hash the password and store it."""
