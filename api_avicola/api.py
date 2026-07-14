@@ -304,6 +304,14 @@ class User(db.Model):
     )
     initials = db.Column(db.String(10))
     profile_image_url = db.Column(db.String(500))
+    mfa_enabled = db.Column(
+        db.Boolean,
+        nullable=False,
+        default=False,
+    )
+    mfa_secret_encrypted = db.Column(db.String(512))
+    mfa_enrolled_at = db.Column(db.DateTime)
+    mfa_last_verified_at = db.Column(db.DateTime)
     
     def set_password(self, password):
         """Hash the password and store it."""
@@ -361,7 +369,8 @@ def serialize_user(user):
         "full_name": user.full_name,
         "role": normalize_role(user.role),
         "initials": user.initials,
-        "profile_image_url": user.profile_image_url
+        "profile_image_url": user.profile_image_url,
+        "mfa_enabled": bool(user.mfa_enabled),
     }
 
 
