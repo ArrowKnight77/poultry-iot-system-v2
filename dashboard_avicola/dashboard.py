@@ -1,12 +1,15 @@
-from flask import Flask, render_template, request, redirect, flash, jsonify
+from flask import Flask, render_template, request, redirect, flash, jsonify, session
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, login_user, logout_user, login_required, UserMixin, current_user
 from flask_cors import CORS, cross_origin
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
+import base64
+from io import BytesIO
 import os
 import requests
 import json
+import qrcode
 from datetime import datetime
 
 
@@ -20,6 +23,11 @@ app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=(os.getenv("FLASK_ENV", "production").lower() == "production"),
+)
 
 # Security: Rate Limiting
 limiter = Limiter(
@@ -35,6 +43,10 @@ def add_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
     response.headers['X-XSS-Protection'] = '1; mode=block'
+
+    if request.endpoint == "login":
+        response.headers["Cache-Control"] = "no-store"
+
     return response
 
 db = SQLAlchemy(app)
@@ -155,6 +167,13 @@ class User(UserMixin, db.Model):
     def normalized_role(self):
         return normalize_role(self.role)
 
+    def has_complete_mfa_enrollment(self):
+        return bool(
+            self.mfa_enabled
+            and self.mfa_secret_encrypted
+            and self.mfa_enrolled_at
+        )
+
 # No crear usuarios automáticamente
 # El primer usuario debe registrarse manualmente
 try:
@@ -168,6 +187,31 @@ except Exception as e:
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
+
+
+@app.before_request
+def enforce_admin_mfa_session():
+    if not current_user.is_authenticated:
+        return None
+
+    if current_user.normalized_role() != "admin":
+        return None
+
+    verified_user_id = session.get("mfa_verified_user_id")
+    if (
+        verified_user_id == current_user.id
+        and current_user.has_complete_mfa_enrollment()
+    ):
+        return None
+
+    logout_user()
+    session.pop("mfa_verified_user_id", None)
+
+    if request.endpoint == "login":
+        return None
+
+    flash("La sesión administrativa requiere verificación MFA.")
+    return redirect("/login")
 
 def get_live_data():
     """Obtiene datos en tiempo real desde la API del dashboard"""
@@ -236,26 +280,168 @@ def get_umbrales_from_api():
         print(f"❌ Error obteniendo umbrales: {e}")
         return []
 
+
+def dashboard_auth_headers():
+    proxy_key = os.getenv("DASHBOARD_PROXY_KEY", "")
+    headers = {}
+
+    if proxy_key:
+        headers["X-Dashboard-Proxy-Key"] = proxy_key
+        headers["X-Dashboard-Source-IP"] = request.remote_addr or ""
+
+    return headers
+
+
+def build_mfa_qr_data_uri(provisioning_uri):
+    if not isinstance(provisioning_uri, str) or not provisioning_uri.startswith(
+        "otpauth://totp/"
+    ):
+        return None
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=6,
+        border=4,
+    )
+    qr.add_data(provisioning_uri)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    encoded_image = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded_image}"
+
+
+def render_mfa_challenge(response_data):
+    challenge_token = response_data.get("challenge_token", "")
+    setup_required = bool(response_data.get("mfa_setup_required"))
+    api_user = response_data.get("user") or {}
+
+    if (
+        not isinstance(challenge_token, str)
+        or not challenge_token
+        or len(challenge_token) > 4096
+        or not isinstance(api_user, dict)
+    ):
+        flash("No fue posible iniciar el reto MFA. Intente nuevamente.")
+        return render_template("login.html")
+
+    qr_data_uri = None
+    manual_entry_key = None
+
+    if setup_required:
+        manual_entry_key = response_data.get("manual_entry_key", "")
+        provisioning_uri = response_data.get("provisioning_uri", "")
+        qr_data_uri = build_mfa_qr_data_uri(provisioning_uri)
+
+        if (
+            not qr_data_uri
+            or not isinstance(manual_entry_key, str)
+            or not manual_entry_key
+        ):
+            flash("No fue posible preparar el enrolamiento MFA.")
+            return render_template("login.html")
+
+    challenge_expires_in = response_data.get("challenge_expires_in", 300)
+    try:
+        challenge_expires_in = int(challenge_expires_in)
+    except (TypeError, ValueError):
+        challenge_expires_in = 300
+
+    challenge_expires_in = min(max(challenge_expires_in, 60), 900)
+
+    if response_data.get("error"):
+        flash(str(response_data["error"])[:200])
+
+    return render_template(
+        "login.html",
+        mfa_step=True,
+        mfa_setup_required=setup_required,
+        mfa_challenge_token=challenge_token,
+        mfa_username=str(api_user.get("username", ""))[:80],
+        mfa_qr_data_uri=qr_data_uri,
+        mfa_manual_entry_key=manual_entry_key,
+        mfa_challenge_expires_in=challenge_expires_in,
+    )
+
+
+def complete_dashboard_login(response_data):
+    api_user = response_data.get("user", {})
+    user_id = api_user.get("id") if isinstance(api_user, dict) else None
+    user = db.session.get(User, user_id) if user_id else None
+
+    if not user:
+        app.logger.error(
+            "dashboard_login_user_not_found user_id=%s",
+            user_id,
+        )
+        flash("No fue posible iniciar la sesión. Contacte al administrador.")
+        return render_template("login.html")
+
+    if (
+        user.normalized_role() == "admin"
+        and (
+            response_data.get("mfa_verified") is not True
+            or not user.has_complete_mfa_enrollment()
+        )
+    ):
+        app.logger.error(
+            "dashboard_admin_login_missing_mfa user_id=%s",
+            user.id,
+        )
+        flash("La sesión administrativa requiere verificación MFA.")
+        return render_template("login.html")
+
+    session.pop("mfa_verified_user_id", None)
+    login_user(user)
+
+    if user.normalized_role() == "admin":
+        session["mfa_verified_user_id"] = user.id
+
+    return redirect("/dashboard")
+
 @app.route('/login', methods=['GET', 'POST'])
 @limiter.limit("10 per minute")
 def login():
     if request.method == 'POST':
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-
-        if not username or not password:
-            flash("Usuario y contraseña son requeridos.")
-            return render_template("login.html")
-
         api_url = os.getenv("API_BASE_URL", "http://api:5000").rstrip("/")
+        challenge_token = request.form.get(
+            "mfa_challenge_token",
+            "",
+        ).strip()
+
+        if challenge_token:
+            code = request.form.get("totp_code", "").strip()
+
+            if not code:
+                flash("El código MFA es requerido.")
+                return render_template("login.html")
+
+            endpoint = f"{api_url}/api/mfa/verify"
+            payload = {
+                "challenge_token": challenge_token,
+                "code": code,
+            }
+        else:
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+
+            if not username or not password:
+                flash("Usuario y contraseña son requeridos.")
+                return render_template("login.html")
+
+            endpoint = f"{api_url}/api/login"
+            payload = {
+                "username": username,
+                "password": password,
+            }
 
         try:
             api_response = requests.post(
-                f"{api_url}/api/login",
-                json={
-                    "username": username,
-                    "password": password,
-                },
+                endpoint,
+                json=payload,
+                headers=dashboard_auth_headers(),
                 timeout=5,
             )
         except requests.RequestException as exc:
@@ -272,21 +458,13 @@ def login():
             response_data = {}
 
         if api_response.status_code == 200:
-            api_user = response_data.get("user", {})
-            user_id = api_user.get("id") if isinstance(api_user, dict) else None
-            user = db.session.get(User, user_id) if user_id else None
+            return complete_dashboard_login(response_data)
 
-            if not user:
-                app.logger.error(
-                    "dashboard_login_user_not_found user_id=%s",
-                    user_id,
-                )
-                flash("No fue posible iniciar la sesión. Contacte al administrador.")
-                return render_template("login.html")
-
-            # La API ya validó credenciales, bloqueo y contador persistente.
-            login_user(user)
-            return redirect("/dashboard")
+        if (
+            api_response.status_code in (202, 401)
+            and response_data.get("mfa_required") is True
+        ):
+            return render_mfa_challenge(response_data)
 
         if api_response.status_code == 429:
             raw_retry_after = response_data.get(
@@ -306,7 +484,11 @@ def login():
                 lockout_seconds=retry_after_seconds,
             )
 
-        if api_response.status_code in (400, 401):
+        if challenge_token and api_response.status_code in (400, 401):
+            flash(
+                str(response_data.get("error") or "El reto MFA expiró.")[:200]
+            )
+        elif api_response.status_code in (400, 401):
             flash("Usuario o contraseña incorrectos")
         else:
             app.logger.warning(
@@ -385,6 +567,7 @@ def register():
 @login_required
 def logout():
     logout_user()
+    session.pop("mfa_verified_user_id", None)
     return redirect('/login')
 
 #pestañas de dashboard

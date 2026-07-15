@@ -1,20 +1,28 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 from functools import wraps
+import hashlib
 import os
 import re
 import jwt
 import hmac
+import secrets
 from datetime import datetime, timedelta
 import requests
 import logging
 import sys
 import time
+
+from api_avicola.mfa_security import (
+    MFAConfigurationError,
+    MFASecretError,
+    MFAService,
+)
 
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
@@ -158,9 +166,25 @@ login_lockout_minutes = read_positive_security_int(
     "LOGIN_LOCKOUT_MINUTES",
     15,
 )
+mfa_challenge_expires_minutes = read_positive_security_int(
+    "MFA_CHALLENGE_EXPIRES_MINUTES",
+    5,
+    minimum=1,
+    maximum=15,
+)
 
 login_failure_window = timedelta(minutes=login_failure_window_minutes)
 login_lockout_duration = timedelta(minutes=login_lockout_minutes)
+mfa_challenge_duration = timedelta(minutes=mfa_challenge_expires_minutes)
+
+try:
+    mfa_service = MFAService(
+        encryption_key=os.getenv("MFA_ENCRYPTION_KEY"),
+        issuer_name=os.getenv("MFA_ISSUER", "Poultry IoT System"),
+        valid_window=1,
+    )
+except MFAConfigurationError as exc:
+    raise RuntimeError(str(exc)) from exc
 
 app.config.update(
     SECRET_KEY=secret_key,
@@ -197,6 +221,10 @@ def add_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
     response.headers['X-XSS-Protection'] = '1; mode=block'
+
+    if request.path in ("/api/login", "/api/mfa/verify"):
+        response.headers["Cache-Control"] = "no-store"
+
     return response
 
 # DB PostgreSQL configuration
@@ -211,6 +239,10 @@ CURRENT_PASSWORD_HASH_PREFIX = "scrypt:"
 SUPPORTED_PASSWORD_HASH_PREFIXES = ("scrypt:", "pbkdf2:")
 CANONICAL_ROLES = ("admin", "operador", "visor")
 DEFAULT_USER_ROLE = "visor"
+MFA_REQUIRED_ROLES = {"admin"}
+MFA_CHALLENGE_PURPOSES = {"enroll", "verify"}
+MFA_CHALLENGE_TOKEN_TYPE = "mfa_challenge"
+ACCESS_TOKEN_TYPE = "access"
 ROLE_ALIASES = {
     "admin": "admin",
     "administrator": "admin",
@@ -333,6 +365,19 @@ class User(db.Model):
     def password_hash_scheme(self):
         return password_hash_scheme(self.password_hash)
 
+    def set_mfa_secret(self, secret):
+        self.mfa_secret_encrypted = mfa_service.encrypt_secret(secret)
+
+    def get_mfa_secret(self):
+        return mfa_service.decrypt_secret(self.mfa_secret_encrypted)
+
+    def has_complete_mfa_enrollment(self):
+        return bool(
+            self.mfa_enabled
+            and self.mfa_secret_encrypted
+            and self.mfa_enrolled_at
+        )
+
 
 class LoginLockout(db.Model):
     """Estado persistente de fallos y bloqueos temporales por usuario."""
@@ -374,7 +419,7 @@ def serialize_user(user):
     }
 
 
-def generate_jwt_token(user):
+def generate_jwt_token(user, mfa_verified=False):
     """Generate signed JWT access token for authenticated API users."""
     now = datetime.utcnow()
     expires_at = now + timedelta(minutes=jwt_access_token_expires_minutes)
@@ -383,6 +428,8 @@ def generate_jwt_token(user):
         "sub": str(user.id),
         "username": user.username,
         "role": normalize_role(user.role),
+        "type": ACCESS_TOKEN_TYPE,
+        "mfa_verified": bool(mfa_verified),
         "iat": now,
         "exp": expires_at,
     }
@@ -392,7 +439,20 @@ def generate_jwt_token(user):
 
 def decode_jwt_token(token):
     """Decode and validate JWT access token."""
-    return jwt.decode(token, jwt_secret_key, algorithms=["HS256"])
+    return jwt.decode(
+        token,
+        jwt_secret_key,
+        algorithms=["HS256"],
+        options={
+            "require": [
+                "sub",
+                "type",
+                "mfa_verified",
+                "iat",
+                "exp",
+            ]
+        },
+    )
 
 
 def get_bearer_token():
@@ -466,6 +526,22 @@ def get_current_user_from_token():
             return None, (jsonify({
                 "error": "Usuario no encontrado."
             }), 401)
+
+        if payload.get("type") != ACCESS_TOKEN_TYPE:
+            return None, (jsonify({
+                "error": "Token de acceso inválido."
+            }), 401)
+
+        if user_requires_mfa(user):
+            if not user.has_complete_mfa_enrollment():
+                return None, (jsonify({
+                    "error": "Configuración MFA requerida."
+                }), 401)
+
+            if payload.get("mfa_verified") is not True:
+                return None, (jsonify({
+                    "error": "Verificación MFA requerida."
+                }), 401)
 
         return user, None
 
@@ -837,20 +913,23 @@ def register_login_failure(username, source_ip, now=None):
     return lockout, lockout_triggered
 
 
-def clear_login_lockout(username):
+def clear_login_lockout(username, commit=True):
     """Eliminar el contador después de un inicio de sesión válido."""
     lockout = LoginLockout.query.filter_by(username=username).first()
 
     if not lockout:
-        return
+        return False
 
     db.session.delete(lockout)
-    db.session.commit()
 
-    logger.info(
-        "event=login_lockout_cleared username=%s",
-        safe_log_value(username, limit=64),
-    )
+    if commit:
+        db.session.commit()
+        logger.info(
+            "event=login_lockout_cleared username=%s",
+            safe_log_value(username, limit=64),
+        )
+
+    return True
 
 
 def build_login_lockout_response(retry_after_seconds):
@@ -863,6 +942,176 @@ def build_login_lockout_response(retry_after_seconds):
     response.headers["Retry-After"] = str(retry_after_seconds)
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def user_requires_mfa(user):
+    return normalize_role(user.role) in MFA_REQUIRED_ROLES
+
+
+def mfa_challenge_state(user):
+    """Vincular el reto al estado actual de contraseña y MFA del usuario."""
+    state_parts = (
+        str(user.id),
+        user.password_hash or "",
+        user.mfa_secret_encrypted or "",
+        "1" if user.mfa_enabled else "0",
+        user.mfa_enrolled_at.isoformat() if user.mfa_enrolled_at else "",
+        (
+            user.mfa_last_verified_at.isoformat()
+            if user.mfa_last_verified_at
+            else ""
+        ),
+    )
+    state_value = "\x1f".join(state_parts).encode("utf-8")
+    return hmac.new(
+        jwt_secret_key.encode("utf-8"),
+        state_value,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def generate_mfa_challenge_token(user, purpose):
+    if purpose not in MFA_CHALLENGE_PURPOSES:
+        raise ValueError("Propósito de reto MFA inválido.")
+
+    now = datetime.utcnow()
+    payload = {
+        "sub": str(user.id),
+        "username": user.username,
+        "type": MFA_CHALLENGE_TOKEN_TYPE,
+        "purpose": purpose,
+        "challenge_state": mfa_challenge_state(user),
+        "jti": secrets.token_urlsafe(16),
+        "iat": now,
+        "exp": now + mfa_challenge_duration,
+    }
+    return jwt.encode(payload, jwt_secret_key, algorithm="HS256")
+
+
+def decode_mfa_challenge_token(token):
+    payload = jwt.decode(
+        token,
+        jwt_secret_key,
+        algorithms=["HS256"],
+        options={
+            "require": [
+                "sub",
+                "type",
+                "purpose",
+                "challenge_state",
+                "jti",
+                "iat",
+                "exp",
+            ]
+        },
+    )
+
+    if payload.get("type") != MFA_CHALLENGE_TOKEN_TYPE:
+        raise jwt.InvalidTokenError("Tipo de token inválido.")
+
+    if payload.get("purpose") not in MFA_CHALLENGE_PURPOSES:
+        raise jwt.InvalidTokenError("Propósito de token inválido.")
+
+    return payload
+
+
+def ensure_admin_mfa_secret(user, source_ip):
+    user = db.session.execute(
+        select(User)
+        .where(User.id == user.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+
+    if user.mfa_secret_encrypted:
+        return user.get_mfa_secret()
+
+    secret = mfa_service.generate_secret()
+    user.set_mfa_secret(secret)
+    db.session.commit()
+
+    logger.info(
+        "event=mfa_enrollment_started user_id=%s username=%s source_ip=%s",
+        user.id,
+        safe_log_value(user.username, limit=64),
+        source_ip,
+    )
+    record_security_event(
+        event_type="mfa_enrollment_started",
+        severity="info",
+        source="api",
+        source_ip=source_ip,
+        actor_username=user.username,
+        user_id=user.id,
+        role=normalize_role(user.role),
+    )
+    return secret
+
+
+def build_mfa_challenge_response(
+    user,
+    setup_required,
+    source_ip,
+    error=None,
+    status_code=202,
+):
+    purpose = "enroll" if setup_required else "verify"
+    payload = {
+        "msg": (
+            "MFA enrollment required"
+            if setup_required
+            else "MFA verification required"
+        ),
+        "mfa_required": True,
+        "mfa_setup_required": setup_required,
+        "challenge_expires_in": mfa_challenge_expires_minutes * 60,
+        "user": serialize_user(user),
+    }
+
+    if error:
+        payload["error"] = error
+
+    if setup_required:
+        secret = ensure_admin_mfa_secret(user, source_ip)
+        payload["provisioning_uri"] = mfa_service.provisioning_uri(
+            secret,
+            user.username,
+        )
+        payload["manual_entry_key"] = secret
+
+    payload["challenge_token"] = generate_mfa_challenge_token(user, purpose)
+
+    response = jsonify(payload)
+    response.status_code = status_code
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def build_authenticated_login_response(user, source_ip, mfa_verified=False):
+    access_token = generate_jwt_token(
+        user,
+        mfa_verified=mfa_verified,
+    )
+    logger.info(
+        "event=login_succeeded user_id=%s username=%s role=%s mfa=%s "
+        "source_ip=%s",
+        user.id,
+        safe_log_value(user.username, limit=64),
+        safe_log_value(normalize_role(user.role), limit=32),
+        str(bool(mfa_verified)).lower(),
+        source_ip,
+    )
+
+    response = jsonify({
+        "msg": "Login successful",
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": jwt_access_token_expires_minutes * 60,
+        "mfa_verified": bool(mfa_verified),
+        "user": serialize_user(user),
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response, 200
 
 
 class Granja(db.Model):
@@ -1485,7 +1734,7 @@ def login_user():
             }), 400
 
         lockout_username = normalize_login_username(username)
-        source_ip = request_source_ip()
+        source_ip = request_audit_source_ip()
         now = datetime.utcnow()
 
         active_lockout = get_active_login_lockout(lockout_username, now)
@@ -1535,24 +1784,51 @@ def login_user():
 
         if user and user.check_password(password):
             migrate_user_password_hash_if_needed(user, password, source_ip)
+
+            if user_requires_mfa(user):
+                setup_required = not bool(user.mfa_enabled)
+
+                if not setup_required and not user.has_complete_mfa_enrollment():
+                    logger.error(
+                        "event=mfa_state_invalid user_id=%s username=%s "
+                        "source_ip=%s",
+                        user.id,
+                        safe_log_value(user.username, limit=64),
+                        source_ip,
+                    )
+                    record_security_event(
+                        event_type="mfa_state_invalid",
+                        severity="error",
+                        source="api",
+                        source_ip=source_ip,
+                        actor_username=user.username,
+                        user_id=user.id,
+                        role=normalize_role(user.role),
+                    )
+                    return jsonify({
+                        "error": "Configuración MFA inválida."
+                    }), 500
+
+                logger.info(
+                    "event=mfa_challenge_issued user_id=%s username=%s "
+                    "purpose=%s source_ip=%s",
+                    user.id,
+                    safe_log_value(user.username, limit=64),
+                    "enroll" if setup_required else "verify",
+                    source_ip,
+                )
+                return build_mfa_challenge_response(
+                    user,
+                    setup_required=setup_required,
+                    source_ip=source_ip,
+                )
+
             clear_login_lockout(lockout_username)
-
-            access_token = generate_jwt_token(user)
-            logger.info(
-                "event=login_succeeded user_id=%s username=%s role=%s source_ip=%s",
-                user.id,
-                safe_log_value(user.username, limit=64),
-                safe_log_value(normalize_role(user.role), limit=32),
-                source_ip,
+            return build_authenticated_login_response(
+                user,
+                source_ip=source_ip,
+                mfa_verified=False,
             )
-
-            return jsonify({
-                "msg": "Login successful",
-                "access_token": access_token,
-                "token_type": "Bearer",
-                "expires_in": jwt_access_token_expires_minutes * 60,
-                "user": serialize_user(user)
-            }), 200
 
         lockout, lockout_triggered = register_login_failure(
             lockout_username,
@@ -1612,6 +1888,202 @@ def login_user():
         return jsonify({"error": "Error interno durante login."}), 500
 
 
+@app.route('/api/mfa/verify', methods=['POST'])
+@limiter.limit("10 per minute")
+def verify_mfa_challenge():
+    source_ip = request_audit_source_ip()
+
+    try:
+        data = request.get_json(silent=True)
+
+        if not isinstance(data, dict):
+            return jsonify({"error": "JSON inválido o ausente."}), 400
+
+        challenge_token = data.get("challenge_token", "").strip()
+        code = data.get("code", "").strip()
+
+        if not challenge_token or not code:
+            return jsonify({
+                "error": "Reto MFA y código son requeridos."
+            }), 400
+
+        if len(challenge_token) > 4096 or len(code) > 12:
+            return jsonify({"error": "Solicitud MFA inválida."}), 400
+
+        try:
+            challenge = decode_mfa_challenge_token(challenge_token)
+        except jwt.ExpiredSignatureError:
+            return jsonify({
+                "error": "El reto MFA expiró. Inicia sesión nuevamente."
+            }), 401
+        except (jwt.InvalidTokenError, ValueError, TypeError):
+            return jsonify({
+                "error": "Reto MFA inválido. Inicia sesión nuevamente."
+            }), 401
+
+        try:
+            user_id = int(challenge["sub"])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"error": "Reto MFA inválido."}), 401
+
+        user = db.session.execute(
+            select(User)
+            .where(User.id == user_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
+        if not user or not user_requires_mfa(user):
+            return jsonify({"error": "Reto MFA inválido."}), 401
+
+        provided_state = str(challenge.get("challenge_state", ""))
+        if not hmac.compare_digest(
+            provided_state,
+            mfa_challenge_state(user),
+        ):
+            return jsonify({
+                "error": "El estado MFA cambió. Inicia sesión nuevamente."
+            }), 401
+
+        purpose = challenge["purpose"]
+        setup_required = purpose == "enroll"
+
+        if setup_required == bool(user.mfa_enabled):
+            return jsonify({
+                "error": "El estado MFA cambió. Inicia sesión nuevamente."
+            }), 401
+
+        lockout_username = normalize_login_username(user.username)
+        now = datetime.utcnow()
+        active_lockout = get_active_login_lockout(lockout_username, now)
+
+        if active_lockout:
+            return build_login_lockout_response(
+                get_login_lockout_retry_after_seconds(active_lockout, now)
+            )
+
+        try:
+            secret = user.get_mfa_secret()
+        except MFASecretError:
+            logger.exception(
+                "event=mfa_secret_unavailable user_id=%s username=%s "
+                "source_ip=%s",
+                user.id,
+                safe_log_value(user.username, limit=64),
+                source_ip,
+            )
+            record_security_event(
+                event_type="mfa_secret_unavailable",
+                severity="error",
+                source="api",
+                source_ip=source_ip,
+                actor_username=user.username,
+                user_id=user.id,
+            )
+            return jsonify({
+                "error": "No fue posible validar MFA."
+            }), 500
+
+        matched_step = mfa_service.verify_code(
+            secret,
+            code,
+            now=now,
+            last_verified_at=user.mfa_last_verified_at,
+        )
+
+        if matched_step is None:
+            lockout, lockout_triggered = register_login_failure(
+                lockout_username,
+                source_ip,
+                now,
+            )
+            logger.warning(
+                "event=mfa_verification_failed user_id=%s username=%s "
+                "purpose=%s failed_attempts=%s source_ip=%s",
+                user.id,
+                safe_log_value(user.username, limit=64),
+                purpose,
+                lockout.failed_attempts,
+                source_ip,
+            )
+            record_security_event(
+                event_type="mfa_verification_failed",
+                severity="warning",
+                source="api",
+                source_ip=source_ip,
+                actor_username=user.username,
+                purpose=purpose,
+                failed_attempts=lockout.failed_attempts,
+            )
+
+            if lockout_triggered:
+                retry_after_seconds = get_login_lockout_retry_after_seconds(
+                    lockout,
+                    now,
+                )
+                record_security_event(
+                    event_type="mfa_lockout_triggered",
+                    severity="warning",
+                    source="api",
+                    source_ip=source_ip,
+                    actor_username=user.username,
+                    failed_attempts=lockout.failed_attempts,
+                    retry_after_seconds=retry_after_seconds,
+                )
+                return build_login_lockout_response(retry_after_seconds)
+
+            return build_mfa_challenge_response(
+                user,
+                setup_required=setup_required,
+                source_ip=source_ip,
+                error="Código MFA inválido o ya utilizado.",
+                status_code=401,
+            )
+
+        if setup_required:
+            user.mfa_enabled = True
+            user.mfa_enrolled_at = now
+            event_type = "mfa_enrollment_completed"
+        else:
+            event_type = "mfa_login_succeeded"
+
+        user.mfa_last_verified_at = matched_step
+        lockout_cleared = clear_login_lockout(
+            lockout_username,
+            commit=False,
+        )
+        db.session.commit()
+
+        if lockout_cleared:
+            logger.info(
+                "event=login_lockout_cleared username=%s",
+                safe_log_value(lockout_username, limit=64),
+            )
+
+        record_security_event(
+            event_type=event_type,
+            severity="info",
+            source="api",
+            source_ip=source_ip,
+            actor_username=user.username,
+            user_id=user.id,
+            role=normalize_role(user.role),
+        )
+
+        return build_authenticated_login_response(
+            user,
+            source_ip=source_ip,
+            mfa_verified=True,
+        )
+
+    except Exception:
+        db.session.rollback()
+        logger.exception(
+            "event=mfa_processing_failed source_ip=%s",
+            source_ip,
+        )
+        return jsonify({"error": "Error interno durante MFA."}), 500
+
+
 @app.route('/api/auth/verify', methods=['GET'])
 def verify_auth_token():
     token = get_bearer_token()
@@ -1628,6 +2100,16 @@ def verify_auth_token():
 
         if not user:
             return jsonify({"error": "Usuario no encontrado."}), 401
+
+        if payload.get("type") != ACCESS_TOKEN_TYPE:
+            return jsonify({"error": "Token de acceso inválido."}), 401
+
+        if user_requires_mfa(user):
+            if not user.has_complete_mfa_enrollment():
+                return jsonify({"error": "Configuración MFA requerida."}), 401
+
+            if payload.get("mfa_verified") is not True:
+                return jsonify({"error": "Verificación MFA requerida."}), 401
 
         return jsonify({
             "valid": True,
