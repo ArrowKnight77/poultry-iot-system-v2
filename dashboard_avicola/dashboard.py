@@ -1,16 +1,27 @@
-from flask import Flask, render_template, request, redirect, flash, jsonify, session
+from flask import (
+    Flask,
+    abort,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, login_user, logout_user, login_required, UserMixin, current_user
 from flask_cors import CORS, cross_origin
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 import base64
+from functools import wraps
 from io import BytesIO
 import os
 import requests
 import json
 import qrcode
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 
@@ -18,6 +29,23 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 load_dotenv()
+
+
+def read_bounded_int(name, default, minimum, maximum):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+
+    return min(max(value, minimum), maximum)
+
+
+dashboard_session_expires_minutes = read_bounded_int(
+    "DASHBOARD_SESSION_EXPIRES_MINUTES",
+    default=60,
+    minimum=15,
+    maximum=1440,
+)
 
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key')
@@ -27,6 +55,10 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=(os.getenv("FLASK_ENV", "production").lower() == "production"),
+    PERMANENT_SESSION_LIFETIME=timedelta(
+        minutes=dashboard_session_expires_minutes
+    ),
+    SESSION_REFRESH_EACH_REQUEST=False,
 )
 
 # Security: Rate Limiting
@@ -66,6 +98,32 @@ ROLE_ALIASES = {
     "viewer": "visor",
     "user": "visor",
     "usuario": "visor",
+}
+ROLE_PERMISSIONS = {
+    "admin": {
+        "update_thresholds": True,
+        "manage_alerts": True,
+        "delete_alerts": True,
+        "manage_infrastructure": True,
+        "assign_modules": True,
+        "view_security_events": True,
+    },
+    "operador": {
+        "update_thresholds": True,
+        "manage_alerts": True,
+        "delete_alerts": False,
+        "manage_infrastructure": False,
+        "assign_modules": True,
+        "view_security_events": True,
+    },
+    "visor": {
+        "update_thresholds": False,
+        "manage_alerts": False,
+        "delete_alerts": False,
+        "manage_infrastructure": False,
+        "assign_modules": False,
+        "view_security_events": False,
+    },
 }
 
 
@@ -110,6 +168,11 @@ def normalize_role(role):
         return DEFAULT_USER_ROLE
 
     return ROLE_ALIASES.get(raw_role, DEFAULT_USER_ROLE)
+
+
+def permissions_for_role(role):
+    normalized_role = normalize_role(role)
+    return dict(ROLE_PERMISSIONS[normalized_role])
 
 
 dashboard_cors_origins_raw = os.getenv(
@@ -174,6 +237,72 @@ class User(UserMixin, db.Model):
             and self.mfa_enrolled_at
         )
 
+
+def serialize_dashboard_user(user):
+    """Expose only presentation-safe identity and authorization state."""
+    role = user.normalized_role()
+
+    return {
+        'id': user.id,
+        'username': user.username,
+        'full_name': user.full_name,
+        'role': role,
+        'initials': user.initials,
+        'profile_image_url': user.profile_image_url,
+        'mfa_required': role == 'admin',
+        'mfa_enabled': bool(user.mfa_enabled),
+        'mfa_enrolled': user.has_complete_mfa_enrollment(),
+        'mfa_last_verified_at': (
+            user.mfa_last_verified_at.isoformat()
+            if user.mfa_last_verified_at
+            else None
+        ),
+        'permissions': permissions_for_role(role),
+        'session_expires_minutes': dashboard_session_expires_minutes,
+    }
+
+
+def is_dashboard_api_request():
+    return request.path.startswith(('/api/', '/dashboard-api/'))
+
+
+def forbidden_json_response():
+    return jsonify({
+        'error': 'Permisos insuficientes.',
+        'details': [
+            'Tu rol no permite realizar esta acción.'
+        ],
+        'code': 'forbidden',
+    }), 403
+
+
+def require_dashboard_roles(*allowed_roles):
+    allowed = {normalize_role(role) for role in allowed_roles}
+
+    if current_user.normalized_role() in allowed:
+        return None
+
+    return forbidden_json_response()
+
+
+def dashboard_roles_required(*allowed_roles):
+    allowed = {normalize_role(role) for role in allowed_roles}
+
+    def decorator(view):
+        @wraps(view)
+        @login_required
+        def wrapped(*args, **kwargs):
+            if current_user.normalized_role() not in allowed:
+                if is_dashboard_api_request():
+                    return forbidden_json_response()
+                abort(403)
+
+            return view(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
+
 # No crear usuarios automáticamente
 # El primer usuario debe registrarse manualmente
 try:
@@ -187,6 +316,33 @@ except Exception as e:
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
+
+
+@login_manager.unauthorized_handler
+def unauthorized():
+    if is_dashboard_api_request():
+        return jsonify({
+            'error': 'La sesión expiró. Inicia sesión nuevamente.',
+            'code': 'session_expired',
+        }), 401
+
+    return redirect(url_for('login'))
+
+
+@app.errorhandler(403)
+def forbidden_page(_error):
+    if is_dashboard_api_request():
+        return forbidden_json_response()
+
+    user_data = (
+        serialize_dashboard_user(current_user)
+        if current_user.is_authenticated
+        else None
+    )
+    return render_template(
+        'error_403.html',
+        user_data=user_data,
+    ), 403
 
 
 @app.before_request
@@ -205,10 +361,16 @@ def enforce_admin_mfa_session():
         return None
 
     logout_user()
-    session.pop("mfa_verified_user_id", None)
+    session.clear()
 
     if request.endpoint == "login":
         return None
+
+    if is_dashboard_api_request():
+        return jsonify({
+            'error': 'La sesión administrativa requiere verificación MFA.',
+            'code': 'mfa_required',
+        }), 401
 
     flash("La sesión administrativa requiere verificación MFA.")
     return redirect("/login")
@@ -393,8 +555,9 @@ def complete_dashboard_login(response_data):
         flash("La sesión administrativa requiere verificación MFA.")
         return render_template("login.html")
 
-    session.pop("mfa_verified_user_id", None)
-    login_user(user)
+    session.clear()
+    session.permanent = True
+    login_user(user, remember=False, fresh=True)
 
     if user.normalized_role() == "admin":
         session["mfa_verified_user_id"] = user.id
@@ -404,6 +567,9 @@ def complete_dashboard_login(response_data):
 @app.route('/login', methods=['GET', 'POST'])
 @limiter.limit("10 per minute")
 def login():
+    if request.method == 'GET' and current_user.is_authenticated:
+        return redirect('/dashboard')
+
     if request.method == 'POST':
         api_url = os.getenv("API_BASE_URL", "http://api:5000").rstrip("/")
         challenge_token = request.form.get(
@@ -497,7 +663,12 @@ def login():
             )
             flash("Error en el sistema. Intente nuevamente.")
 
-    return render_template("login.html")
+    return render_template(
+        "login.html",
+        session_expired=(
+            request.args.get('reason') == 'session-expired'
+        ),
+    )
 
 
 @app.route('/register', methods=['GET', 'POST'])
@@ -563,11 +734,11 @@ def register():
     
     return render_template('login.html', show_register=True)
 
-@app.route('/logout')
+@app.route('/logout', methods=['POST'])
 @login_required
 def logout():
     logout_user()
-    session.pop("mfa_verified_user_id", None)
+    session.clear()
     return redirect('/login')
 
 #pestañas de dashboard
@@ -585,24 +756,11 @@ def dashboard():
         flash('Base de datos no disponible. Espere a que el sistema inicie completamente.')
         return redirect('/login')
     
-    # DEBUG: Verificar estado del usuario actual
-    print(f"DEBUG: current_user is_authenticated: {current_user.is_authenticated}")
-    print(f"DEBUG: current_user id: {getattr(current_user, 'id', 'None')}")
-    print(f"DEBUG: current_user username: {getattr(current_user, 'username', 'None')}")
-    
-    # Pasar datos del usuario a la plantilla
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.normalized_role(),
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    
-    print(f"DEBUG: user_data being passed: {user_data}")
-    
-    return render_template('dashboard.html', user_data=user_data)
+    return render_template(
+        'dashboard.html',
+        active='dashboard',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 
 @app.route('/api/historical')
@@ -666,6 +824,11 @@ def api_live_data():
 @login_required
 def api_umbrales():
     """Proxy autenticado para consultar y actualizar umbrales."""
+    if request.method == 'POST':
+        denied = require_dashboard_roles('admin', 'operador')
+        if denied:
+            return denied
+
     try:
         if request.method == 'GET':
             r = requests.get(
@@ -776,6 +939,10 @@ def proxy_alert_stats():
 @app.route('/api/alerts/<int:alert_id>', methods=['PUT'])
 @login_required
 def proxy_alert(alert_id):
+    denied = require_dashboard_roles('admin', 'operador')
+    if denied:
+        return denied
+
     try:
         r = requests.put(
             f'{_api_url()}/api/alerts/{alert_id}',
@@ -791,6 +958,10 @@ def proxy_alert(alert_id):
 @app.route('/api/alerts/mark-all', methods=['PUT'])
 @login_required
 def proxy_mark_all_alerts():
+    denied = require_dashboard_roles('admin', 'operador')
+    if denied:
+        return denied
+
     try:
         r = requests.put(
             f'{_api_url()}/api/alerts/mark-all',
@@ -805,6 +976,10 @@ def proxy_mark_all_alerts():
 @app.route('/api/alerts/all', methods=['DELETE'])
 @login_required
 def proxy_delete_all_alerts():
+    denied = require_dashboard_roles('admin')
+    if denied:
+        return denied
+
     try:
         r = requests.delete(
             f'{_api_url()}/api/alerts/all',
@@ -819,6 +994,10 @@ def proxy_delete_all_alerts():
 @app.route('/api/alerts/check', methods=['POST'])
 @login_required
 def proxy_alert_check():
+    denied = require_dashboard_roles('admin', 'operador')
+    if denied:
+        return denied
+
     try:
         r = requests.post(
             f'{_api_url()}/api/alerts/check',
@@ -830,9 +1009,32 @@ def proxy_alert_check():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/security-events', methods=['GET'])
+@dashboard_roles_required('admin', 'operador')
+def proxy_security_events():
+    try:
+        r = requests.get(
+            f'{_api_url()}/api/security-events',
+            params=request.args.to_dict(),
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except requests.RequestException:
+        app.logger.exception('dashboard_security_events_proxy_failed')
+        return jsonify({
+            'error': 'No fue posible consultar los eventos de seguridad.'
+        }), 502
+
+
 @app.route('/api/granjas', methods=['GET', 'POST'])
 @login_required
 def proxy_granjas():
+    if request.method == 'POST':
+        denied = require_dashboard_roles('admin')
+        if denied:
+            return denied
+
     try:
         if request.method == 'GET':
             r = requests.get(
@@ -855,6 +1057,10 @@ def proxy_granjas():
 @app.route('/api/granjas/<int:granja_id>', methods=['PUT', 'DELETE'])
 @login_required
 def proxy_granja(granja_id):
+    denied = require_dashboard_roles('admin')
+    if denied:
+        return denied
+
     try:
         if request.method == 'PUT':
             r = requests.put(
@@ -877,6 +1083,11 @@ def proxy_granja(granja_id):
 @app.route('/api/naves', methods=['GET', 'POST'])
 @login_required
 def proxy_naves():
+    if request.method == 'POST':
+        denied = require_dashboard_roles('admin')
+        if denied:
+            return denied
+
     try:
         if request.method == 'GET':
             r = requests.get(
@@ -900,6 +1111,10 @@ def proxy_naves():
 @app.route('/api/naves/<int:nave_id>', methods=['PUT', 'DELETE'])
 @login_required
 def proxy_nave(nave_id):
+    denied = require_dashboard_roles('admin')
+    if denied:
+        return denied
+
     try:
         if request.method == 'PUT':
             r = requests.put(
@@ -936,6 +1151,10 @@ def proxy_modulos():
 @app.route('/api/modulos/<string:codigo>', methods=['PUT'])
 @login_required
 def proxy_modulo(codigo):
+    denied = require_dashboard_roles('admin', 'operador')
+    if denied:
+        return denied
+
     try:
         r = requests.put(
             f'{_api_url()}/api/modulos/{codigo}',
@@ -970,80 +1189,66 @@ def index():
 @app.route('/historical')
 @login_required
 def historical():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.normalized_role(),
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('historical.html', active='historical', user_data=user_data)
+    return render_template(
+        'historical.html',
+        active='historical',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 @app.route('/analysis')
 @login_required
 def analysis():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.normalized_role(),
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('analysis.html', active='analysis', user_data=user_data)
+    return render_template(
+        'analysis.html',
+        active='analysis',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 @app.route('/alerts')
 @login_required
 def alerts():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.normalized_role(),
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('alerts.html', active='alerts', user_data=user_data)
+    return render_template(
+        'alerts.html',
+        active='alerts',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 @app.route('/devices')
 @login_required
 def devices():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.normalized_role(),
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('devices.html', active='devices', user_data=user_data)
+    return render_template(
+        'devices.html',
+        active='devices',
+        user_data=serialize_dashboard_user(current_user),
+    )
+
+
+@app.route('/security-events')
+@dashboard_roles_required('admin', 'operador')
+def security_events():
+    return render_template(
+        'security_events.html',
+        active='security_events',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 @app.route('/ml_models')
 @login_required
 def ml_models():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.normalized_role(),
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('ml_models.html', active='ml_models', user_data=user_data)
+    return render_template(
+        'ml_models.html',
+        active='ml_models',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 @app.route('/reports')
 @login_required
 def reports():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.normalized_role(),
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('reports.html', active='reports', user_data=user_data)
+    return render_template(
+        'reports.html',
+        active='reports',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 # En dashboard_avicola.py, modifica la función start:
 def start(port=5001, host='0.0.0.0'):
