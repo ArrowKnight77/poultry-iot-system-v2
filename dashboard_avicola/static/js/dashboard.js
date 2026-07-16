@@ -1066,15 +1066,21 @@ async function saveThresholds() {
     });
 
     if (res.ok) {
-      alert('Umbrales actualizados correctamente');
+      showDashboardAlert(t('dashboard.thresholds_saved'), 'success');
       const modal = bootstrap.Modal.getInstance(document.getElementById('thresholdsModal'));
       modal.hide();
     } else {
-      throw new Error('Error saving thresholds');
+      throw new Error(await dashboardApiError(
+        res,
+        t('dashboard.thresholds_error')
+      ));
     }
   } catch (err) {
     console.error('Error saving thresholds:', err);
-    alert('Error guardando cambios');
+    showDashboardAlert(
+      err.message || t('dashboard.thresholds_error'),
+      'danger'
+    );
   }
 }
 

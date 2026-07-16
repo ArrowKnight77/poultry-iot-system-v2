@@ -9,12 +9,16 @@
     <p class="text-muted mb-0 d-none d-md-block" data-i18n="alerts.subtitle">Alertas generadas cuando los valores superan los umbrales configurados</p>
   </div>
   <div class="d-flex flex-column flex-sm-row gap-2 w-100 w-md-auto">
+    {% if user_data.permissions.manage_alerts %}
     <button class="btn btn-primary btn-sm" onclick="markAllAsRead()">
       <i class="bi bi-check-lg me-1"></i><span data-i18n="alerts.btn_mark_all">Marcar todas como vistas</span>
     </button>
+    {% endif %}
+    {% if user_data.permissions.delete_alerts %}
     <button class="btn btn-danger btn-sm" onclick="deleteAllAlerts()">
       <i class="bi bi-trash me-1"></i><span data-i18n="alerts.btn_delete_all">Eliminar todas</span>
     </button>
+    {% endif %}
     <button class="btn btn-outline-secondary btn-sm" onclick="exportAlerts()">
       <i class="bi bi-download me-1"></i><span data-i18n="alerts.btn_export">Exportar</span>
     </button>
@@ -140,6 +144,7 @@
   let allAlerts = [];
   let filteredAlerts = [];
   const API_BASE = window.location.origin;
+  const CAN_MANAGE_ALERTS = {{ user_data.permissions.manage_alerts|tojson }};
 
   async function populateModuleFilter() {
     try {
@@ -170,7 +175,12 @@
       if (params.toString()) url += '?' + params.toString();
 
       const response = await fetch(url);
-      if (!response.ok) throw new Error(response.statusText);
+      if (!response.ok) {
+        throw new Error(await dashboardApiError(
+          response,
+          t('alerts.error_load')
+        ));
+      }
 
       allAlerts = await response.json();
       allAlerts.forEach(a => {
@@ -190,7 +200,12 @@
   async function loadStats() {
     try {
       const response = await fetch(`${API_BASE}/api/alerts/stats`);
-      if (!response.ok) throw new Error(response.statusText);
+      if (!response.ok) {
+        throw new Error(await dashboardApiError(
+          response,
+          t('alerts.error_update')
+        ));
+      }
       const stats = await response.json();
       document.getElementById('criticalCount').textContent = stats.critical || 0;
       document.getElementById('warningCount').textContent  = stats.warning  || 0;
@@ -207,11 +222,16 @@
         `${API_BASE}/api/alerts/${id}`,
         { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ estado: status }) }
       );
-      if (!response.ok) throw new Error(response.statusText);
+      if (!response.ok) {
+        throw new Error(await dashboardApiError(
+          response,
+          t('alerts.error_update')
+        ));
+      }
       loadAlerts(); loadStats();
     } catch (error) {
       console.error(error);
-      alert(t('alerts.error_update') + ': ' + error.message);
+      showDashboardAlert(error.message || t('alerts.error_update'));
     }
   }
 
@@ -221,11 +241,16 @@
         `${API_BASE}/api/alerts/mark-all`,
         { method: 'PUT' }
       );
-      if (!response.ok) throw new Error(response.statusText);
+      if (!response.ok) {
+        throw new Error(await dashboardApiError(
+          response,
+          t('alerts.error_mark_all')
+        ));
+      }
       loadAlerts(); loadStats();
     } catch (error) {
       console.error(error);
-      alert(t('alerts.error_mark_all') + ': ' + error.message);
+      showDashboardAlert(error.message || t('alerts.error_mark_all'));
     }
   }
 
@@ -236,11 +261,16 @@
         `${API_BASE}/api/alerts/all`,
         { method: 'DELETE' }
       );
-      if (!response.ok) throw new Error(response.statusText);
+      if (!response.ok) {
+        throw new Error(await dashboardApiError(
+          response,
+          t('alerts.error_delete')
+        ));
+      }
       loadAlerts(); loadStats();
     } catch (error) {
       console.error(error);
-      alert(t('alerts.error_delete') + ': ' + error.message);
+      showDashboardAlert(error.message || t('alerts.error_delete'));
     }
   }
 
@@ -279,6 +309,16 @@
     return `${days} d`;
   }
 
+  function escapeAlertValue(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
   function renderAlerts(alertsToRender) {
     const container = document.getElementById('alertsList');
     if (!alertsToRender.length) {
@@ -296,15 +336,15 @@
             <div class="d-flex align-items-center gap-2 mb-2">
               ${getPriorityBadge(alert.prioridad)}
               ${getStatusBadge(alert.estado)}
-              <strong>${alert.tipo.charAt(0).toUpperCase() + alert.tipo.slice(1)}</strong>
+              <strong>${escapeAlertValue(String(alert.tipo || '').replace(/^./, value => value.toUpperCase()))}</strong>
               <span class="text-muted">•</span>
-              <span class="text-muted">${alert.modulo}</span>
+              <span class="text-muted">${escapeAlertValue(alert.modulo)}</span>
             </div>
-            <p class="mb-2">${alert.mensaje}</p>
+            <p class="mb-2">${escapeAlertValue(alert.mensaje)}</p>
             <div class="small text-muted">
-              <span><strong>${t('alerts.lbl_value')}</strong> ${alert.valor_actual || 'N/A'}</span>
-              <span class="ms-3"><strong>${t('alerts.lbl_threshold')}</strong> ${alert.umbral || 'N/A'}</span>
-              <span class="ms-3"><strong>${t('alerts.lbl_sensor')}</strong> ${alert.sensor || 'N/A'}</span>
+              <span><strong>${t('alerts.lbl_value')}</strong> ${escapeAlertValue(alert.valor_actual || 'N/A')}</span>
+              <span class="ms-3"><strong>${t('alerts.lbl_threshold')}</strong> ${escapeAlertValue(alert.umbral || 'N/A')}</span>
+              <span class="ms-3"><strong>${t('alerts.lbl_sensor')}</strong> ${escapeAlertValue(alert.sensor || 'N/A')}</span>
             </div>
             <div class="small text-muted mt-1">
               <span>${formatTimeAgo(alert.timestamp)}</span>
@@ -312,7 +352,7 @@
             </div>
           </div>
           <div class="d-flex gap-2">
-            ${alert.estado === 'active' ? `
+            ${CAN_MANAGE_ALERTS && alert.estado === 'active' ? `
               <button class="btn btn-sm btn-outline-primary" onclick="updateAlertStatus(${alert.id},'acknowledged')">
                 ${t('alerts.btn_mark_seen')}
               </button>
@@ -320,7 +360,7 @@
                 ${t('alerts.btn_mark_resolved')}
               </button>
             ` : ''}
-            ${alert.estado === 'acknowledged' ? `
+            ${CAN_MANAGE_ALERTS && alert.estado === 'acknowledged' ? `
               <button class="btn btn-sm btn-outline-success" onclick="updateAlertStatus(${alert.id},'resolved')">
                 ${t('alerts.btn_mark_resolved')}
               </button>

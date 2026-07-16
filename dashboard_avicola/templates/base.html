@@ -64,13 +64,19 @@
       z-index: 1000;
       overflow-y: auto;
       transform: translateX(0);
+      display: flex;
+      flex-direction: column;
     }
 
     .sidebar.collapsed {
       transform: translateX(-100%);
     }
 
-    .sidebar a {
+    .sidebar-nav {
+      flex: 1;
+    }
+
+    .sidebar .sidebar-link {
       color: white;
       text-decoration: none;
       display: block;
@@ -78,11 +84,26 @@
       margin: 5px 10px;
       border-radius: 8px;
       transition: background-color 0.2s;
+      border: 0;
+      background: transparent;
+      width: calc(100% - 20px);
+      text-align: left;
     }
 
-    .sidebar a:hover,
-    .sidebar a.active {
+    .sidebar .sidebar-link:hover,
+    .sidebar .sidebar-link.active {
       background-color: #388e3c;
+    }
+
+    .sidebar-footer {
+      border-top: 1px solid rgba(255, 255, 255, 0.22);
+      padding: 8px 0 12px;
+      margin-top: 12px;
+    }
+
+    .mfa-status-row {
+      border-top: 1px solid #dee2e6;
+      padding-top: 1rem;
     }
 
     .content {
@@ -190,21 +211,33 @@
       </div>
     </div>
 
-    <a href="/dashboard" class="{% if active=='dashboard' %}active{% endif %}"><i class="bi bi-speedometer2 me-2"></i><span data-i18n="nav.dashboard">Dashboard</span></a>
-    <a href="/historical" class="{% if active=='historical' %}active{% endif %}"><i class="bi bi-clock-history me-2"></i><span data-i18n="nav.historical">Datos Históricos</span></a>
-    <a href="/alerts" class="{% if active=='alerts' %}active{% endif %}"><i class="bi bi-exclamation-triangle me-2"></i><span data-i18n="nav.alerts">Alertas</span></a>
-    <a href="/devices" class="{% if active=='devices' %}active{% endif %}"><i class="bi bi-house-door me-2"></i><span data-i18n="nav.devices">Naves y Módulos</span></a>
+    <nav class="sidebar-nav" aria-label="Navegación principal">
+      <a href="/dashboard" class="sidebar-link {% if active=='dashboard' %}active{% endif %}"><i class="bi bi-speedometer2 me-2"></i><span data-i18n="nav.dashboard">Dashboard</span></a>
+      <a href="/historical" class="sidebar-link {% if active=='historical' %}active{% endif %}"><i class="bi bi-clock-history me-2"></i><span data-i18n="nav.historical">Datos Históricos</span></a>
+      <a href="/alerts" class="sidebar-link {% if active=='alerts' %}active{% endif %}"><i class="bi bi-exclamation-triangle me-2"></i><span data-i18n="nav.alerts">Alertas</span></a>
+      <a href="/devices" class="sidebar-link {% if active=='devices' %}active{% endif %}"><i class="bi bi-house-door me-2"></i><span data-i18n="nav.devices">Naves y Módulos</span></a>
+      {% if user_data and user_data.permissions.view_security_events %}
+      <a href="/security-events" class="sidebar-link {% if active=='security_events' %}active{% endif %}"><i class="bi bi-shield-exclamation me-2"></i><span data-i18n="nav.security_events">Eventos de seguridad</span></a>
+      {% endif %}
+    </nav>
 
-    <!-- <a href="/analysis" class="{% if active=='analysis' %}active{% endif %}"><i
-        class="bi bi-graph-up me-2"></i>Analysis</a>
-    <a href="/ml_models" class="{% if active=='ml_models' %}active{% endif %}"><i class="bi bi-robot me-2"></i>ML
-      Models</a>
-    <a href="/reports" class="{% if active=='reports' %}active{% endif %}"><i
-        class="bi bi-file-earmark-text me-2"></i>Reports</a>
-    -->
+    <form class="sidebar-footer" action="/logout" method="POST" onsubmit="clearDashboardIdentity()">
+      <button type="submit" class="sidebar-link" title="Cerrar sesión">
+        <i class="bi bi-box-arrow-right me-2"></i><span data-i18n="nav.logout">Cerrar sesión</span>
+      </button>
+    </form>
   </div>
 
   <div class="content" id="content">
+    <div id="globalApiAlert" class="alert d-none" role="alert" aria-live="assertive">
+      <div class="d-flex align-items-start justify-content-between gap-3">
+        <div>
+          <i class="bi bi-shield-exclamation me-2"></i>
+          <span id="globalApiAlertMessage"></span>
+        </div>
+        <button type="button" class="btn-close" aria-label="Cerrar" onclick="hideDashboardAlert()"></button>
+      </div>
+    </div>
     {% block content %}{% endblock %}
   </div>
 
@@ -233,6 +266,15 @@
             <label class="form-label" data-i18n="profile.initials">Iniciales</label>
             <input type="text" class="form-control" id="editInitials" value="DG" maxlength="3">
           </div>
+          <div class="mfa-status-row">
+            <div class="d-flex justify-content-between align-items-center gap-3">
+              <div>
+                <div class="form-label mb-1" data-i18n="profile.mfa_status">Estado MFA</div>
+                <small class="text-muted" id="mfaStatusDetail"></small>
+              </div>
+              <span class="badge" id="mfaStatusBadge"></span>
+            </div>
+          </div>
         </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" data-i18n="profile.close">Cerrar</button>
@@ -246,26 +288,19 @@
   <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.js"></script>
 
   <script>
-    // DEBUG: Check if user_data is passed from Flask
-    console.log('User data from Flask:', {{ user_data|tojson|safe }});
-    
-    // Initialize user data from Flask template with fallback
-    {% if user_data %}
-    console.log('Setting user_data to localStorage:', {{ user_data|tojson|safe }});
-    localStorage.setItem('currentUser', JSON.stringify({{ user_data|tojson|safe }}));
-    {% else %}
-    console.log('No user_data received from Flask, using fallback');
-    // Fallback: Create default user data for testing
-    const fallbackUser = {
-        id: 1,
-        username: 'admin',
-        full_name: 'Administrator',
-        role: 'admin',
-        initials: 'AD',
-        profile_image_url: null
+    const serverUser = {{ user_data|default(none)|tojson|safe }};
+
+    if (serverUser) {
+      localStorage.setItem('currentUser', JSON.stringify(serverUser));
+    } else {
+      localStorage.removeItem('currentUser');
+    }
+
+    window.dashboardUser = serverUser;
+    window.dashboardPermissions = serverUser?.permissions || {};
+    window.dashboardCan = function (permission) {
+      return window.dashboardPermissions[permission] === true;
     };
-    localStorage.setItem('currentUser', JSON.stringify(fallbackUser));
-    {% endif %}
 
     document.getElementById("lastUpdate").innerText = new Date().toLocaleString();
     const overlay = document.getElementById('overlay');
@@ -301,8 +336,81 @@
       }
     }
 
+    function clearDashboardIdentity() {
+      localStorage.removeItem('currentUser');
+    }
+
+    function hideDashboardAlert() {
+      document.getElementById('globalApiAlert')?.classList.add('d-none');
+    }
+
+    function showDashboardAlert(message, level = 'danger') {
+      const alertBox = document.getElementById('globalApiAlert');
+      const messageBox = document.getElementById('globalApiAlertMessage');
+      if (!alertBox || !messageBox) return;
+
+      alertBox.className = `alert alert-${level}`;
+      messageBox.textContent = message;
+      alertBox.classList.remove('d-none');
+      alertBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    async function dashboardApiError(response, fallback) {
+      try {
+        const data = await response.clone().json();
+        if (Array.isArray(data.details) && data.details.length) {
+          return data.details.join(' ');
+        }
+        return data.error || fallback;
+      } catch (_error) {
+        return fallback;
+      }
+    }
+
+    function isDashboardApiUrl(input) {
+      const value = typeof input === 'string' ? input : input?.url;
+      if (!value) return false;
+
+      const url = new URL(value, window.location.origin);
+      return url.origin === window.location.origin
+        && (
+          url.pathname.startsWith('/api/')
+          || url.pathname.startsWith('/dashboard-api/')
+        );
+    }
+
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async function (input, init) {
+      const response = await nativeFetch(input, init);
+
+      if (!isDashboardApiUrl(input)) {
+        return response;
+      }
+
+      if (response.status === 401) {
+        clearDashboardIdentity();
+        window.location.replace('/login?reason=session-expired');
+        return response;
+      }
+
+      if (response.status === 403) {
+        const message = await dashboardApiError(
+          response,
+          t('errors.forbidden')
+        );
+        showDashboardAlert(message, 'danger');
+      }
+
+      return response;
+    };
+
+    window.clearDashboardIdentity = clearDashboardIdentity;
+    window.hideDashboardAlert = hideDashboardAlert;
+    window.showDashboardAlert = showDashboardAlert;
+    window.dashboardApiError = dashboardApiError;
+
     // AUTH & PROFILE LOGIC
-    let currentUser = null;
+    let currentUser = serverUser;
 
     function getBaseUrl() {
       const currentPort = window.location.port;
@@ -313,16 +421,43 @@
     }
 
     function loadUserProfile() {
-      console.log('Loading user profile');
-      const userStr = localStorage.getItem('currentUser');
-      console.log('User string from localStorage:', userStr);
-      
-      if (userStr) {
-        currentUser = JSON.parse(userStr);
-        console.log('Parsed currentUser:', currentUser);
+      if (currentUser) {
         updateProfileUI(currentUser);
-      } else {
-        console.log('No user found in localStorage');
+      }
+    }
+
+    function roleLabel(role) {
+      return t(`roles.${role}`);
+    }
+
+    function updateMfaStatus(user) {
+      const badge = document.getElementById('mfaStatusBadge');
+      const detail = document.getElementById('mfaStatusDetail');
+      if (!badge || !detail) return;
+
+      if (!user.mfa_required) {
+        badge.className = 'badge bg-secondary';
+        badge.textContent = t('profile.mfa_not_required');
+        detail.textContent = t('profile.mfa_role_not_required');
+        return;
+      }
+
+      if (!user.mfa_enabled || !user.mfa_enrolled) {
+        badge.className = 'badge bg-warning text-dark';
+        badge.textContent = t('profile.mfa_pending');
+        detail.textContent = t('profile.mfa_pending_detail');
+        return;
+      }
+
+      badge.className = 'badge bg-success';
+      badge.textContent = t('profile.mfa_active');
+      detail.textContent = t('profile.mfa_admin_protected');
+
+      if (user.mfa_last_verified_at) {
+        const verifiedAt = new Date(user.mfa_last_verified_at);
+        if (!Number.isNaN(verifiedAt.getTime())) {
+          detail.textContent += ` ${t('profile.mfa_last_verified')} ${verifiedAt.toLocaleString()}`;
+        }
       }
     }
 
@@ -332,8 +467,8 @@
 
       document.getElementById('userName').innerText = fullName;
       document.getElementById('userName').title = fullName;
-      document.getElementById('userRole').innerText = role;
-      document.getElementById('userRole').title = role;
+      document.getElementById('userRole').innerText = roleLabel(role);
+      document.getElementById('userRole').title = roleLabel(role);
 
       const initialsEl = document.getElementById('userInitials');
       const imageEl = document.getElementById('userImage');
@@ -347,6 +482,8 @@
         initialsEl.style.display = 'block';
         imageEl.style.display = 'none';
       }
+
+      updateMfaStatus(user);
     }
 
     function openProfileSettings() {
@@ -402,7 +539,11 @@
         });
 
         if (!res.ok) {
-          alert(t('profile.error_update'));
+          const message = await dashboardApiError(
+            res,
+            t('profile.error_update')
+          );
+          showDashboardAlert(message, 'danger');
           return;
         }
 
@@ -415,7 +556,7 @@
         ).hide();
       } catch (err) {
         console.error(err);
-        alert(t('profile.error_connection'));
+        showDashboardAlert(t('profile.error_connection'), 'danger');
       }
     }
 
@@ -430,6 +571,10 @@
           }
         });
       });
+    });
+
+    document.addEventListener('langchange', function () {
+      if (currentUser) updateProfileUI(currentUser);
     });
 
     window.addEventListener('resize', function () {

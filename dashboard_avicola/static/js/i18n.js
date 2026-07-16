@@ -13,6 +13,17 @@
       'nav.historical': 'Datos Históricos',
       'nav.alerts': 'Alertas',
       'nav.devices': 'Naves y Módulos',
+      'nav.security_events': 'Eventos de seguridad',
+      'nav.logout': 'Cerrar sesión',
+
+      // Roles y permisos
+      'roles.admin': 'Administrador',
+      'roles.operador': 'Operador',
+      'roles.visor': 'Visor',
+      'errors.forbidden': 'Permisos insuficientes para realizar esta acción.',
+      'errors.forbidden_title': 'Acceso restringido',
+      'errors.forbidden_detail': 'Tu rol no tiene permiso para realizar esta acción o abrir esta vista.',
+      'errors.back_dashboard': 'Volver al dashboard',
 
       // Perfil
       'profile.edit_title': 'Editar Perfil',
@@ -23,6 +34,14 @@
       'profile.save': 'Guardar cambios',
       'profile.error_update': 'Error al actualizar perfil',
       'profile.error_connection': 'Error de conexión',
+      'profile.mfa_status': 'Estado MFA',
+      'profile.mfa_not_required': 'No requerido',
+      'profile.mfa_role_not_required': 'Este rol no requiere segundo factor.',
+      'profile.mfa_pending': 'Configuración pendiente',
+      'profile.mfa_pending_detail': 'El siguiente inicio de sesión solicitará configurar MFA.',
+      'profile.mfa_active': 'Activo',
+      'profile.mfa_admin_protected': 'El acceso administrativo requiere contraseña y código TOTP.',
+      'profile.mfa_last_verified': 'Última verificación:',
 
       // Login
       'login.title': 'Iniciar Sesión',
@@ -64,6 +83,7 @@
       'login.mfa_minutes': 'minutos.',
       'login.mfa_verify_button': 'Verificar código',
       'login.mfa_cancel': 'Cancelar y volver al inicio',
+      'login.session_expired': 'Tu sesión expiró. Inicia sesión nuevamente para continuar.',
 
       // Dashboard
       'dashboard.title': 'Dashboard',
@@ -106,6 +126,8 @@
       'dashboard.chart_nh3': 'NH₃ (ppm)',
       'dashboard.chart_co': 'CO (ppm)',
       'dashboard.chart_co2': 'CO₂ (ppm)',
+      'dashboard.thresholds_saved': 'Umbrales actualizados correctamente.',
+      'dashboard.thresholds_error': 'No fue posible actualizar los umbrales.',
       // Parvada card
       'dashboard.parvada_granja': 'Granja',
       'dashboard.parvada_nave': 'Nave',
@@ -159,6 +181,36 @@
       'alerts.error_update': 'Error al actualizar alerta',
       'alerts.error_mark_all': 'Error al marcar alertas',
       'alerts.error_delete': 'Error al eliminar alertas',
+
+      // Eventos de seguridad
+      'security_events.title': 'Eventos de seguridad',
+      'security_events.subtitle': 'Auditoría de autenticación, privilegios y dispositivos IoT.',
+      'security_events.refresh': 'Actualizar',
+      'security_events.total': 'Total',
+      'security_events.info': 'Informativos',
+      'security_events.warning': 'Advertencias',
+      'security_events.error': 'Errores o críticos',
+      'security_events.filters': 'Filtros',
+      'security_events.severity': 'Severidad',
+      'security_events.all': 'Todas',
+      'security_events.info_single': 'Info',
+      'security_events.warning_single': 'Advertencia',
+      'security_events.error_single': 'Error',
+      'security_events.critical_single': 'Crítico',
+      'security_events.source': 'Origen',
+      'security_events.all_sources': 'Todos',
+      'security_events.module': 'Módulo',
+      'security_events.module_placeholder': 'Todos los módulos',
+      'security_events.limit': 'Límite',
+      'security_events.list': 'Registro de eventos',
+      'security_events.date': 'Fecha',
+      'security_events.event': 'Evento',
+      'security_events.origin': 'Origen / módulo',
+      'security_events.actor': 'Actor / IP',
+      'security_events.details': 'Detalles',
+      'security_events.loading': 'Cargando eventos...',
+      'security_events.empty': 'No se encontraron eventos con estos filtros.',
+      'security_events.load_error': 'No fue posible cargar los eventos de seguridad.',
 
       // Histórico
       'historical.title': 'Datos Históricos',
@@ -306,6 +358,17 @@
       'nav.historical': 'Historical Data',
       'nav.alerts': 'Alerts',
       'nav.devices': 'Houses & Modules',
+      'nav.security_events': 'Security events',
+      'nav.logout': 'Sign out',
+
+      // Roles and permissions
+      'roles.admin': 'Administrator',
+      'roles.operador': 'Operator',
+      'roles.visor': 'Viewer',
+      'errors.forbidden': 'You do not have permission to perform this action.',
+      'errors.forbidden_title': 'Restricted access',
+      'errors.forbidden_detail': 'Your role cannot perform this action or open this view.',
+      'errors.back_dashboard': 'Back to dashboard',
 
       // Profile
       'profile.edit_title': 'Edit Profile',
@@ -316,6 +379,14 @@
       'profile.save': 'Save changes',
       'profile.error_update': 'Error updating profile',
       'profile.error_connection': 'Connection error',
+      'profile.mfa_status': 'MFA status',
+      'profile.mfa_not_required': 'Not required',
+      'profile.mfa_role_not_required': 'This role does not require a second factor.',
+      'profile.mfa_pending': 'Setup pending',
+      'profile.mfa_pending_detail': 'The next sign-in will require MFA setup.',
+      'profile.mfa_active': 'Active',
+      'profile.mfa_admin_protected': 'Administrative access requires a password and TOTP code.',
+      'profile.mfa_last_verified': 'Last verification:',
 
       // Login
       'login.title': 'Sign In',
@@ -357,6 +428,7 @@
       'login.mfa_minutes': 'minutes.',
       'login.mfa_verify_button': 'Verify code',
       'login.mfa_cancel': 'Cancel and return to sign in',
+      'login.session_expired': 'Your session expired. Sign in again to continue.',
 
       // Dashboard
       'dashboard.title': 'Dashboard',
@@ -399,6 +471,8 @@
       'dashboard.chart_nh3': 'NH₃ (ADC Signal)',
       'dashboard.chart_co': 'CO (ADC Signal)',
       'dashboard.chart_co2': 'CO₂ (ppm)',
+      'dashboard.thresholds_saved': 'Thresholds updated successfully.',
+      'dashboard.thresholds_error': 'Unable to update thresholds.',
       // Parvada card
       'dashboard.parvada_granja': 'Farm',
       'dashboard.parvada_nave': 'House',
@@ -452,6 +526,36 @@
       'alerts.error_update': 'Error updating alert',
       'alerts.error_mark_all': 'Error marking all alerts',
       'alerts.error_delete': 'Error deleting alerts',
+
+      // Security events
+      'security_events.title': 'Security events',
+      'security_events.subtitle': 'Audit trail for authentication, privileges, and IoT devices.',
+      'security_events.refresh': 'Refresh',
+      'security_events.total': 'Total',
+      'security_events.info': 'Informational',
+      'security_events.warning': 'Warnings',
+      'security_events.error': 'Errors or critical',
+      'security_events.filters': 'Filters',
+      'security_events.severity': 'Severity',
+      'security_events.all': 'All',
+      'security_events.info_single': 'Info',
+      'security_events.warning_single': 'Warning',
+      'security_events.error_single': 'Error',
+      'security_events.critical_single': 'Critical',
+      'security_events.source': 'Source',
+      'security_events.all_sources': 'All',
+      'security_events.module': 'Module',
+      'security_events.module_placeholder': 'All modules',
+      'security_events.limit': 'Limit',
+      'security_events.list': 'Event log',
+      'security_events.date': 'Date',
+      'security_events.event': 'Event',
+      'security_events.origin': 'Source / module',
+      'security_events.actor': 'Actor / IP',
+      'security_events.details': 'Details',
+      'security_events.loading': 'Loading events...',
+      'security_events.empty': 'No events matched these filters.',
+      'security_events.load_error': 'Unable to load security events.',
 
       // Historical
       'historical.title': 'Historical Data',

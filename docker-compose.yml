@@ -89,6 +89,7 @@ services:
       SECRET_KEY: ${SECRET_KEY}
       FLASK_ENV: ${FLASK_ENV}
       DASHBOARD_PROXY_KEY: "${DASHBOARD_PROXY_KEY}"
+      DASHBOARD_SESSION_EXPIRES_MINUTES: ${DASHBOARD_SESSION_EXPIRES_MINUTES:-60}
     restart: unless-stopped
 
   mqtt_subscriber:

@@ -100,6 +100,15 @@
       <small class="opacity-75" data-i18n="login.subtitle">Sistema de Monitoreo Avícola</small>
     </div>
     <div class="card-body p-4">
+      {% if session_expired %}
+        <div class="alert alert-warning" role="alert">
+          <i class="bi bi-clock-history me-1"></i>
+          <span data-i18n="login.session_expired">
+            Tu sesión expiró. Inicia sesión nuevamente.
+          </span>
+        </div>
+      {% endif %}
+
       {% with messages = get_flashed_messages() %}
         {% if messages %}
           {% for message in messages %}
@@ -119,6 +128,7 @@
             <i class="bi bi-person me-1"></i><span data-i18n="login.lbl_username">Usuario</span>
           </label>
           <input type="text" class="form-control" id="username" name="username" required
+                 autocomplete="username"
                  data-i18n-ph="login.ph_username" placeholder="Ingrese nombre de usuario">
         </div>
 
@@ -135,6 +145,7 @@
             <i class="bi bi-lock me-1"></i><span data-i18n="login.lbl_password">Contraseña</span>
           </label>
           <input type="password" class="form-control" id="password" name="password" required
+                 autocomplete="new-password"
                  data-i18n-ph="login.ph_password" placeholder="Ingrese contraseña (mínimo 6 caracteres)">
         </div>
 
@@ -143,6 +154,7 @@
             <i class="bi bi-lock-fill me-1"></i><span data-i18n="login.lbl_confirm">Confirmar Contraseña</span>
           </label>
           <input type="password" class="form-control" id="confirm_password" name="confirm_password" required
+                 autocomplete="new-password"
                  data-i18n-ph="login.ph_confirm" placeholder="Confirme su contraseña">
         </div>
 
@@ -277,6 +289,7 @@
             <i class="bi bi-person me-1"></i><span data-i18n="login.lbl_username">Usuario</span>
           </label>
           <input type="text" class="form-control" id="username" name="username" required
+                 autocomplete="username"
                  data-i18n-ph="login.ph_username" placeholder="Ingrese nombre de usuario">
         </div>
 
@@ -285,6 +298,7 @@
             <i class="bi bi-lock me-1"></i><span data-i18n="login.lbl_password">Contraseña</span>
           </label>
           <input type="password" class="form-control" id="password" name="password" required
+                 autocomplete="current-password"
                  data-i18n-ph="login.ph_password_short" placeholder="Ingrese contraseña">
         </div>
 
@@ -294,6 +308,7 @@
             class="btn btn-primary-custom mb-3"
             {% if lockout_seconds %}disabled aria-disabled="true"{% endif %}
           >
+          <i class="bi bi-box-arrow-in-right me-1"></i>
           <span data-i18n="login.btn_login">Iniciar Sesión</span>
         </button>
       </form>
