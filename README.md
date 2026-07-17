@@ -45,3 +45,32 @@ Do not commit:
 - database dumps, backups, logs, or debug captures
 
 Remote deployment, TLS, and production security modules are intentionally out of scope for this local baseline.
+
+## PostgreSQL backup
+
+Create a compressed logical backup from the running Docker Compose database:
+
+```bash
+./scripts/backup_postgres.sh
+```
+
+Backups are written to `backups/postgres/` by default with directory mode
+`700` and file mode `600`. The script validates the database connection and
+the generated gzip archive before publishing the final `.sql.gz` file. Backup
+files are intentionally ignored by Git.
+
+On WSL paths mounted from Windows, such as `/mnt/c` or `/mnt/e`, NTFS may show
+permissions such as `777` even after `chmod`. The script reports this condition.
+Production backups must use a Linux filesystem that enforces the expected
+`700` directory and `600` file permissions.
+
+For a protected destination on the server, pass the directory as an argument
+or set `BACKUP_DIR`:
+
+```bash
+./scripts/backup_postgres.sh /srv/poultry-backups
+BACKUP_DIR=/srv/poultry-backups ./scripts/backup_postgres.sh
+```
+
+This commit only creates a local backup. Off-site copies, retention policy and
+restore testing are handled separately in the continuity workflow.
