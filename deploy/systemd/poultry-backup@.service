@@ -1,0 +1,17 @@
+[Unit]
+Description=Poultry IoT PostgreSQL 3-2-1 backup
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+EnvironmentFile=/etc/poultry-iot/backup.env
+ExecStart=/usr/bin/bash -c 'exec "$PROJECT_DIR/scripts/backup_3_2_1.sh"'
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
