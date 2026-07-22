@@ -74,3 +74,62 @@ BACKUP_DIR=/srv/poultry-backups ./scripts/backup_postgres.sh
 
 This commit only creates a local backup. Off-site copies, retention policy and
 restore testing are handled separately in the continuity workflow.
+
+## Daily 3-2-1 backup workflow
+
+The 3-2-1 workflow keeps a compressed backup on the Droplet and uploads an
+immutable, client-side encrypted copy to a Google Drive folder through an
+`rclone crypt` remote. The production database, the local dump and the
+off-site encrypted object provide three copies across Droplet and Google
+storage, with one copy outside the server. A host-side pull can retain an
+additional independent copy on the operator workstation.
+
+Install `rclone` and configure a Google Drive remote authenticated with an
+account that can edit the shared backup folder. In the advanced Drive options,
+set `root_folder_id` to the final segment of that folder's browser URL. Then
+create an `rclone crypt` remote that wraps the Drive remote so database content
+and filenames are encrypted before upload. Keep the OAuth token, crypt password
+and crypt salt outside this repository.
+
+```bash
+rclone config
+rclone lsd poultry-drive:
+rclone lsd poultry-offsite-crypt:
+```
+
+Prepare the configuration and systemd units on the server:
+
+```bash
+sudo install -d -m 700 /etc/poultry-iot
+sudo install -m 600 deploy/backup/backup.env.example /etc/poultry-iot/backup.env
+sudo install -m 644 deploy/systemd/poultry-backup@.service /etc/systemd/system/
+sudo install -m 644 deploy/systemd/poultry-backup@.timer /etc/systemd/system/
+sudoedit /etc/poultry-iot/backup.env
+sudo systemctl daemon-reload
+sudo systemctl enable --now "poultry-backup@$(id -un).timer"
+```
+
+Run one manual service execution before relying on the timer:
+
+```bash
+sudo systemctl start "poultry-backup@$(id -un).service"
+sudo systemctl status "poultry-backup@$(id -un).service" --no-pager
+sudo journalctl -u "poultry-backup@$(id -un).service" -n 50 --no-pager
+systemctl list-timers "poultry-backup@$(id -un).timer"
+```
+
+The timer runs daily at 02:15 with a randomized delay of up to 15 minutes and
+uses `Persistent=true` to run a missed backup after the server becomes
+available again. Retention and restore testing remain separate controls.
+
+From the local WSL environment, use the existing crypt remote to pull decrypted
+backup files onto the Windows host disk without exposing an inbound service on
+the workstation:
+
+```bash
+./scripts/sync_backups_to_host.sh /mnt/e/PoultryBackups
+```
+
+Protect the host destination with NTFS access controls and full-disk encryption
+such as BitLocker. The script only copies missing or changed files and does not
+delete older backups from the host.
