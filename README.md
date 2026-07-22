@@ -133,3 +133,18 @@ the workstation:
 Protect the host destination with NTFS access controls and full-disk encryption
 such as BitLocker. The script only copies missing or changed files and does not
 delete older backups from the host.
+
+## PostgreSQL restore test
+
+Validate a local or off-site backup in an isolated temporary PostgreSQL 15
+container without modifying the production database:
+
+```bash
+./scripts/test_postgres_restore.sh \
+  /srv/poultry-backups/poultry_postgres_YYYYMMDDTHHMMSSZ.sql.gz
+```
+
+The test stops on SQL errors, validates the critical application tables and
+hardening fields, reports only table row counts and removes the temporary
+container when finished. See `docs/restore-test-procedure.md` for local and
+Google Drive recovery steps, evidence rules and expected results.
