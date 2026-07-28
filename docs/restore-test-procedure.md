@@ -91,5 +91,6 @@ No se debe capturar:
 ## Alcance
 
 Esta prueba confirma que el archivo puede restaurarse y que el esquema crítico
-es coherente. La política de retención, los objetivos RTO/RPO y una recuperación
-completa de aplicación corresponden a controles posteriores.
+es coherente. La retención, las responsabilidades, los objetivos RTO/RPO y la
+secuencia de recuperación se definen en la
+[política de continuidad de respaldos](backup-retention-rto-rpo.md).
