@@ -120,7 +120,8 @@ systemctl list-timers "poultry-backup@$(id -un).timer"
 
 The timer runs daily at 02:15 with a randomized delay of up to 15 minutes and
 uses `Persistent=true` to run a missed backup after the server becomes
-available again. Retention and restore testing remain separate controls.
+available again. Retention remains a documented, manually controlled operation
+until a separate automation change is implemented.
 
 From the local WSL environment, use the existing crypt remote to pull decrypted
 backup files onto the Windows host disk without exposing an inbound service on
@@ -146,5 +147,15 @@ container without modifying the production database:
 
 The test stops on SQL errors, validates the critical application tables and
 hardening fields, reports only table row counts and removes the temporary
-container when finished. See `docs/restore-test-procedure.md` for local and
-Google Drive recovery steps, evidence rules and expected results.
+container when finished. See the
+[PostgreSQL restore test procedure](docs/restore-test-procedure.md) for local
+and Google Drive recovery steps, evidence rules and expected results.
+
+## Backup continuity policy
+
+Retention responsibilities, recovery order and measurable RTO/RPO targets are
+defined in the
+[backup continuity policy](docs/backup-retention-rto-rpo.md). The current
+targets are a 24-hour-and-15-minute RPO during normal operation and a four-hour
+RTO after an incident is declared. Backup deletion is not automated by this
+repository.
