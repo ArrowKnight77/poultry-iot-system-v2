@@ -30,6 +30,10 @@ mosquitto/config/passwd
 debug/
 backups/
 *.sql
+*.sql.gz
+*.partial
+rclone.conf
+backup.env
 
 # Las migraciones SQL forman parte del código versionado.
 !scripts/migrations/*.sql
@@ -50,6 +54,11 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+.~lock.*#
+
+# Local document-generation workspaces
+.codex-doc-*/
+.tmp_*_caps/
 
 # Local testing files — track scripts but not data files
 local_tests/*

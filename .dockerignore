@@ -24,8 +24,19 @@ mosquitto/config/passwd
 debug/
 backups/
 *.sql
+*.sql.gz
+*.partial
 *.dump
 *.bak
+rclone.conf
+backup.env
+
+# Local documentation artifacts are not part of runtime images
+*.docx
+*.pdf
+.~lock.*#
+.codex-doc-*/
+.tmp_*_caps/
 
 .DS_Store
 Thumbs.db
