@@ -6,6 +6,7 @@ on:
       - dev
       - main
     paths:
+      - requirements.in
       - requirements.txt
       - pyproject.toml
       - poetry.lock
@@ -15,6 +16,7 @@ on:
       - dev
       - main
     paths:
+      - requirements.in
       - requirements.txt
       - pyproject.toml
       - poetry.lock
