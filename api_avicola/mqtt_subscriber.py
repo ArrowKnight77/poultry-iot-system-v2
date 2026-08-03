@@ -408,8 +408,8 @@ def handle_node_heartbeat(topic, payload_text):
     )
 
 
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
+def on_connect(client, userdata, connect_flags, reason_code, properties):
+    if reason_code == 0:
         client.subscribe(MQTT_TOPIC, qos=1)
         logger.info(
             "event=mqtt_connected broker=%s port=%s topic=%s tls_enabled=%s",
@@ -421,7 +421,7 @@ def on_connect(client, userdata, flags, rc):
     else:
         logger.error(
             "event=mqtt_connection_failed result_code=%s broker=%s port=%s",
-            rc,
+            reason_code,
             safe_log_value(MQTT_BROKER, limit=100),
             MQTT_PORT,
         )
@@ -763,7 +763,7 @@ def start():
     )
 
     try:
-        client = mqtt.Client()
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         if MQTT_USERNAME and MQTT_PASSWORD:
             client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
 
@@ -801,4 +801,3 @@ def stop():
 
 if __name__ == "__main__":
     start()
-

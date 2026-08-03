@@ -20,10 +20,10 @@ La auditoría mantiene dos comprobaciones independientes:
 | Runtime de la aplicación | `requirements.txt` | API, dashboard y subscriber MQTT construidos por Docker |
 | Simulador IoT | `pyproject.toml` en la raíz | Simulador y herramientas MQTT administradas como proyecto Python |
 
-`requirements.txt` y `pyproject.toml` expresan actualmente contratos distintos
-para `paho-mqtt`. El workflow conserva ambos alcances para hacer visible esa
-diferencia. La reconciliación y fijación de versiones corresponde al commit 26;
-el commit 25 no modifica dependencias de producción.
+`requirements.in` declara las dependencias directas del runtime y
+`requirements.txt` bloquea el grafo completo con versiones y hashes. El
+simulador conserva su contrato en `pyproject.toml` y su resolución exacta en
+`poetry.lock`. Ambos alcances usan `paho-mqtt` 2.1.0.
 
 ## 3. Cuándo se ejecuta
 
