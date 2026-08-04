@@ -1,11 +1,30 @@
 FROM python:3.11-slim
 
+ARG APP_UID=10001
+ARG APP_GID=10001
+
+ENV HOME=/home/app \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
+
+RUN groupadd --gid "${APP_GID}" app \
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" \
+        --create-home --home-dir /home/app --shell /usr/sbin/nologin \
+        --no-log-init app
 
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir --require-hashes -r requirements.txt
 
-COPY run_mqtt.py .
-COPY api_avicola/ ./api_avicola/
+COPY --chown=app:app run_mqtt.py .
+COPY --chown=app:app api_avicola/ ./api_avicola/
+
+USER 10001:10001
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import os, sys; sys.exit(0 if os.path.isfile('/tmp/mqtt-connected') else 1)"]
 
 CMD ["python", "run_mqtt.py"]

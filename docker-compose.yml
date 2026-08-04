@@ -32,6 +32,12 @@ services:
       - ./mosquitto/config:/mosquitto/config:ro
       - ./mosquitto/certs/broker:/mosquitto/certs/broker:ro
       - mosquitto_data:/mosquitto/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "1883"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   api:
@@ -46,7 +52,7 @@ services:
       db:
         condition: service_healthy
       mqtt:
-        condition: service_started
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       API_URL: http://api:5000/lecturas
@@ -70,6 +76,16 @@ services:
       LOGIN_LOCKOUT_MINUTES: ${LOGIN_LOCKOUT_MINUTES:-15}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777,uid=10001,gid=10001
+    init: true
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   dashboard:
@@ -82,7 +98,7 @@ services:
       - "127.0.0.1:5001:5001"
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       API_BASE_URL: http://api:5000
@@ -90,6 +106,16 @@ services:
       FLASK_ENV: ${FLASK_ENV}
       DASHBOARD_PROXY_KEY: "${DASHBOARD_PROXY_KEY}"
       DASHBOARD_SESSION_EXPIRES_MINUTES: ${DASHBOARD_SESSION_EXPIRES_MINUTES:-60}
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777,uid=10001,gid=10001
+    init: true
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   mqtt_subscriber:
@@ -102,9 +128,9 @@ services:
       db:
         condition: service_healthy
       mqtt:
-        condition: service_started
+        condition: service_healthy
       api:
-        condition: service_started
+        condition: service_healthy
     environment:
       API_URL: http://api:5000/lecturas
       MQTT_BROKER: mqtt
@@ -120,6 +146,16 @@ services:
       PYTHONUNBUFFERED: "1"
     volumes:
       - ./mosquitto/certs/broker/ca.crt:/mosquitto/certs/ca.crt:ro
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777,uid=10001,gid=10001
+    init: true
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
 volumes:

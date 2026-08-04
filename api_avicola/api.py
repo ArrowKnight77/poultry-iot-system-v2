@@ -233,6 +233,23 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 
+
+@app.get('/api/health')
+@limiter.exempt
+def health_check():
+    """Comprobar que la API puede ejecutar una consulta mínima en PostgreSQL."""
+    try:
+        db.session.execute(text("SELECT 1"))
+        return jsonify({'status': 'ok'}), 200
+    except Exception as exc:
+        db.session.rollback()
+        logger.error(
+            "event=health_check_failed component=api dependency=database "
+            "error_type=%s",
+            type(exc).__name__,
+        )
+        return jsonify({'status': 'unavailable'}), 503
+
 PASSWORD_HASH_METHOD = "scrypt"
 PASSWORD_HASH_SALT_LENGTH = 16
 CURRENT_PASSWORD_HASH_PREFIX = "scrypt:"

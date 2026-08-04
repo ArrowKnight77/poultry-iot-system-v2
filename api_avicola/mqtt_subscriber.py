@@ -21,6 +21,7 @@ MQTT_USERNAME = os.getenv('MQTT_USERNAME')
 MQTT_PASSWORD = os.getenv('MQTT_PASSWORD')
 MQTT_TLS_ENABLED = os.getenv("MQTT_TLS_ENABLED", "false").lower() == "true"
 MQTT_TLS_CA_CERT = os.getenv("MQTT_TLS_CA_CERT")
+MQTT_HEALTH_FILE = os.getenv("MQTT_HEALTH_FILE", "/tmp/mqtt-connected")
 # Por defecto escuchamos todos los módulos y tanto esquema viejo como nuevo
 # - Esquema viejo: sensor/modulo1/temperatura, sensor/modulo1/humedad, etc.
 # - Esquema nuevo: sensor/modulo1/data (JSON con todos los valores)
@@ -56,6 +57,26 @@ logger.info(
     "event=logging_initialized component=mqtt_subscriber level=%s",
     logging.getLevelName(logger.level),
 )
+
+
+def set_mqtt_connection_health(connected):
+    """Mantener un indicador local que Docker pueda consultar sin credenciales."""
+    try:
+        if connected:
+            with open(MQTT_HEALTH_FILE, "w", encoding="utf-8") as marker:
+                marker.write("connected\n")
+            return
+
+        try:
+            os.remove(MQTT_HEALTH_FILE)
+        except FileNotFoundError:
+            pass
+    except OSError as exc:
+        logger.error(
+            "event=mqtt_health_marker_failed connected=%s error_type=%s",
+            int(bool(connected)),
+            type(exc).__name__,
+        )
 
 
 def safe_log_value(value, fallback="-", limit=150):
@@ -411,6 +432,7 @@ def handle_node_heartbeat(topic, payload_text):
 def on_connect(client, userdata, connect_flags, reason_code, properties):
     if reason_code == 0:
         client.subscribe(MQTT_TOPIC, qos=1)
+        set_mqtt_connection_health(True)
         logger.info(
             "event=mqtt_connected broker=%s port=%s topic=%s tls_enabled=%s",
             safe_log_value(MQTT_BROKER, limit=100),
@@ -419,12 +441,29 @@ def on_connect(client, userdata, connect_flags, reason_code, properties):
             MQTT_TLS_ENABLED,
         )
     else:
+        set_mqtt_connection_health(False)
         logger.error(
             "event=mqtt_connection_failed result_code=%s broker=%s port=%s",
             reason_code,
             safe_log_value(MQTT_BROKER, limit=100),
             MQTT_PORT,
         )
+
+
+def on_disconnect(
+    client,
+    userdata,
+    disconnect_flags,
+    reason_code,
+    properties,
+):
+    set_mqtt_connection_health(False)
+    logger.warning(
+        "event=mqtt_disconnected result_code=%s broker=%s port=%s",
+        reason_code,
+        safe_log_value(MQTT_BROKER, limit=100),
+        MQTT_PORT,
+    )
 
 
 def on_message(client, userdata, message):
@@ -752,6 +791,7 @@ def cleanup_old_readings():
         )
 
 def start():
+    set_mqtt_connection_health(False)
     logger.info(
         "event=service_started component=mqtt_subscriber broker=%s port=%s "
         "topic=%s tls_enabled=%s api_url_configured=%s",
@@ -777,6 +817,7 @@ def start():
             client.tls_insecure_set(False)
 
         client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
         client.on_message = on_message
 
         client.connect(MQTT_BROKER, MQTT_PORT, 60)
@@ -794,9 +835,12 @@ def start():
             safe_log_value(MQTT_BROKER, limit=100),
             MQTT_PORT,
         )
+    finally:
+        set_mqtt_connection_health(False)
 
 
 def stop():
+    set_mqtt_connection_health(False)
     logger.info("event=service_stopping component=mqtt_subscriber")
 
 if __name__ == "__main__":

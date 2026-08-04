@@ -83,6 +83,13 @@ def add_security_headers(response):
 
 db = SQLAlchemy(app)
 
+
+@app.get('/health')
+@limiter.exempt
+def health_check():
+    """Exponer una comprobación mínima sin datos ni autenticación."""
+    return jsonify({'status': 'ok'}), 200
+
 PASSWORD_HASH_METHOD = "scrypt"
 PASSWORD_HASH_SALT_LENGTH = 16
 SUPPORTED_PASSWORD_HASH_PREFIXES = ("scrypt:", "pbkdf2:")

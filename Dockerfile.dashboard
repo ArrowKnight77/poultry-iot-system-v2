@@ -1,18 +1,32 @@
 FROM python:3.11-slim
 
+ARG APP_UID=10001
+ARG APP_GID=10001
+
+ENV HOME=/home/app \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN groupadd --gid "${APP_GID}" app \
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" \
+        --create-home --home-dir /home/app --shell /usr/sbin/nologin \
+        --no-log-init app
 
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir --require-hashes -r requirements.txt
 
-COPY run_dashboard.py .
-COPY dashboard_avicola/ ./dashboard_avicola/
+COPY --chown=app:app run_dashboard.py .
+COPY --chown=app:app dashboard_avicola/ ./dashboard_avicola/
+
+USER 10001:10001
 
 EXPOSE 5001
 
-CMD ["python", "run_dashboard.py"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/health', timeout=3).read()"]
+
+CMD ["gunicorn", "--bind", "0.0.0.0:5001", "--workers", "2", "--timeout", "60", "--worker-tmp-dir", "/tmp", "--no-control-socket", "--access-logfile", "-", "--error-logfile", "-", "dashboard_avicola.dashboard:app"]
