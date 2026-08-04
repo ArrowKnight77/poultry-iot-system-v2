@@ -46,6 +46,14 @@ Do not commit:
 
 Remote deployment, TLS, and production security modules are intentionally out of scope for this local baseline.
 
+## Container hardening
+
+The API, dashboard and MQTT subscriber images run as an explicit non-root user
+with a read-only root filesystem, dropped Linux capabilities, bounded process
+counts and service-specific healthchecks. See the
+[container hardening procedure](docs/container-hardening.md) for the control
+matrix, justified vendor-image exceptions, manual validation and rollback.
+
 ## PostgreSQL backup
 
 Create a compressed logical backup from the running Docker Compose database:
