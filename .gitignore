@@ -64,6 +64,9 @@ desktop.ini
 local_tests/*
 !local_tests/.gitkeep
 !local_tests/*.py
+!local_tests/fixtures/
+!local_tests/fixtures/nginx/
+!local_tests/fixtures/nginx/*.conf
 
 # Claude Code session data
 .claude/
