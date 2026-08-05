@@ -44,7 +44,9 @@ Do not commit:
 - MQTT credential files
 - database dumps, backups, logs, or debug captures
 
-Remote deployment, TLS, and production security modules are intentionally out of scope for this local baseline.
+Production credentials, private TLS material and host-generated state remain
+outside this repository. Reproducible deployment templates may be versioned as
+long as they contain no secrets.
 
 ## Container hardening
 
@@ -53,6 +55,15 @@ with a read-only root filesystem, dropped Linux capabilities, bounded process
 counts and service-specific healthchecks. See the
 [container hardening procedure](docs/container-hardening.md) for the control
 matrix, justified vendor-image exceptions, manual validation and rollback.
+
+## Nginx security headers
+
+The production Nginx virtual host is versioned without certificates or private
+keys. Nginx emits one canonical set of security headers, enables HSTS only on
+HTTPS, hides its version and preserves the existing Certbot and reverse-proxy
+layout. See the
+[Nginx security header procedure](docs/nginx-security-headers.md) for local
+tests, browser checks, deployment and HSTS-aware rollback.
 
 ## PostgreSQL backup
 
