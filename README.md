@@ -65,6 +65,14 @@ layout. See the
 [Nginx security header procedure](docs/nginx-security-headers.md) for local
 tests, browser checks, deployment and HSTS-aware rollback.
 
+## Deployment and security evidence
+
+The final phase 6 operator runbook is available in the
+[deployment and security evidence guide](docs/deployment-security-evidence-guide.md).
+It consolidates the dependency, container and Nginx validations, defines safe
+screenshot handling, documents the documentation-only deployment path and
+provides rollback and troubleshooting procedures.
+
 ## PostgreSQL backup
 
 Create a compressed logical backup from the running Docker Compose database:
