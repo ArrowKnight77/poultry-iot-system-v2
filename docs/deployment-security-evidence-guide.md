@@ -493,3 +493,8 @@ El repositorio dispone de una guía única para ejecutar, evidenciar y recuperar
 los controles finales de hardening. La documentación permite repetir las
 validaciones sin depender del historial del chat y separa claramente la
 evidencia permitida de los secretos que nunca deben conservarse.
+
+El cierre global de superficies, roles, puertos y riesgos se conserva en el
+[inventario de endpoints y matriz de riesgos](endpoint-inventory-risk-matrix.md).
+Ese inventario debe actualizarse cuando cambie una ruta, un método, un puerto,
+un tópico MQTT o el estado residual de un riesgo.

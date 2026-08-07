@@ -73,6 +73,15 @@ It consolidates the dependency, container and Nginx validations, defines safe
 screenshot handling, documents the documentation-only deployment path and
 provides rollback and troubleshooting procedures.
 
+## Endpoint inventory and risk matrix
+
+The final hardening inventory maps the public and internal HTTP routes, Docker
+and host ports, MQTT topics, authentication models, RBAC decisions and
+residual risks. See the
+[endpoint inventory and risk matrix](docs/endpoint-inventory-risk-matrix.md)
+for the source-of-truth precedence, validation commands and open remediation
+items that must not be treated as mitigated.
+
 ## PostgreSQL backup
 
 Create a compressed logical backup from the running Docker Compose database:
