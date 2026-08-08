@@ -131,11 +131,11 @@ sólo el `bind` del contenedor.
 | Ruta | Métodos | Ingreso público | Control actual | Estado / riesgo asociado |
 | --- | --- | --- | --- | --- |
 | `/api/health` | GET | Sí, vía `/api/` | Healthcheck mínimo y consulta `SELECT 1` | **Mitigado**; no devuelve versiones ni credenciales |
-| `/lecturas` | POST | Sí | `X-Ingest-Key`, esquema, tipos, rangos y duplicados | **Mitigado**; R-04 |
-| `/lecturas` | GET | Sí | Sin autenticación; devuelve última lectura por módulo | **Parcial**; exposición de telemetría, R-02/R-17 |
-| `/api/live-data` | GET | Sí | Público y exento del limitador | **Parcial**; R-02/R-17 |
-| `/api/historical` | GET | Sí | Público, filtros de rango y exento del limitador | **Parcial**; R-02/R-17 |
-| `/api/register` | POST | Sí | Límite `5/hour`, hash fuerte; acepta el rol solicitado | **Abierto crítico**; R-01 |
+| `/lecturas` | POST | Sí | `X-Ingest-Key`, esquema, tipos, rangos, duplicados y límite `600/min` | **Mitigado**; R-04/R-17 |
+| `/lecturas` | GET | Sí | Sin autenticación; última lectura por módulo y límite `120/min` | **Aceptado con monitoreo**; exposición controlada, R-02/R-17 |
+| `/api/live-data` | GET | Sí | Público y límite específico `120/min` | **Aceptado con monitoreo**; R-02, R-17 mitigado |
+| `/api/historical` | GET | Sí | Público, filtros, máximo 1500 puntos y límite `30/min` | **Aceptado con monitoreo**; R-02, R-17 mitigado |
+| `/api/register` | POST | Sí | JWT `admin`, MFA verificado, límite `5/hour`, hash fuerte y auditoría | **Mitigado**; R-01 |
 | `/api/login` | POST | Sí | Límite `10/min`, bloqueo persistente, JWT y MFA admin | **Mitigado**; R-05 |
 | `/api/mfa/verify` | POST | Sí | Reto firmado y corto, TOTP, anti-replay y límite `10/min` | **Mitigado**; R-05 |
 | `/api/auth/verify` | GET | Sí | Bearer obligatorio, firma, tipo, expiración y usuario | **Mitigado** |
@@ -144,8 +144,8 @@ sólo el `bind` del contenedor.
 | `/api/umbrales` | GET | Sí | Sin autenticación | **Parcial**; R-02 |
 | `/api/umbrales` | POST | Sí | JWT/proxy; `admin` o `operador`; orden validado | **Mitigado**; R-06 |
 | `/api/umbrales/init` | POST | Sí | JWT/proxy; sólo `admin` | **Mitigado**; R-06 |
-| `/api/alerts` | GET | Sí | Sin autenticación y exento del limitador | **Parcial**; R-02/R-17 |
-| `/api/alerts/stats` | GET | Sí | Sin autenticación | **Parcial**; R-02 |
+| `/api/alerts` | GET | Sí | Sin autenticación, máximo solicitado y límite `60/min` | **Aceptado con monitoreo**; R-02, R-17 mitigado |
+| `/api/alerts/stats` | GET | Sí | Sin autenticación y límite `60/min` | **Aceptado con monitoreo**; R-02, R-17 mitigado |
 | `/api/alerts/<int:alert_id>` | PUT | Sí | JWT/proxy; `admin` o `operador` | **Mitigado**; R-06 |
 | `/api/alerts/mark-all` | PUT | Sí | JWT/proxy; `admin` o `operador` | **Mitigado**; R-06 |
 | `/api/alerts/all` | DELETE | Sí | JWT/proxy; sólo `admin`; acción auditada | **Mitigado**; R-06 |
@@ -160,7 +160,7 @@ sólo el `bind` del contenedor.
 | `/api/naves/<int:nave_id>` | PUT, DELETE | Sí | JWT/proxy; sólo `admin`; auditoría | **Mitigado**; R-06 |
 | `/api/modulos` | GET | Sí | Sin autenticación | **Parcial**; estado y última actividad, R-02 |
 | `/api/modulos/<string:codigo>` | PUT | Sí | JWT/proxy; `admin` o `operador`; auditoría | **Mitigado**; R-06 |
-| `/api/parvada/<string:modulo_codigo>` | GET | Sí | Sin autenticación y exento del limitador | **Parcial**; relación módulo/nave/granja, R-02/R-17 |
+| `/api/parvada/<string:modulo_codigo>` | GET | Sí | Sin autenticación y límite `60/min` | **Aceptado con monitoreo**; relación módulo/nave/granja, R-02; R-17 mitigado |
 
 ## 8. Inventario del dashboard y sus proxies
 
@@ -182,11 +182,11 @@ sólo el `bind` del contenedor.
 | `/api/security-events` | GET | Sesión y rol `admin`/`operador`; proxy con llave interna | La coincidencia exacta de Nginx llega al dashboard |
 | `/dashboard-api/user/<int:user_id>` | GET, PUT | Sesión; API aplica identidad, campos y rol | Pública por `location /`; proxy de perfil recomendado |
 | `/api/user/<int:user_id>` | GET, PUT | Ruta proxy equivalente con sesión | Nginx la envía a la API, no al dashboard |
-| `/api/historical` | GET | Sesión | Nginx la envía a la API pública |
-| `/api/live-data` | GET | Sesión | Nginx la envía a la API pública |
+| `/api/historical` | GET | Sesión y límite `30/min` | Nginx la envía a la API pública con límite equivalente |
+| `/api/live-data` | GET | Sesión y límite `120/min` | Nginx la envía a la API pública con límite equivalente |
 | `/api/umbrales` | GET, POST | Sesión; escritura `admin`/`operador` | Nginx la envía a la API |
-| `/api/alerts` | GET | Sesión | Nginx la envía a la API pública |
-| `/api/alerts/stats` | GET | Sesión | Nginx la envía a la API pública |
+| `/api/alerts` | GET | Sesión y límite `60/min` | Nginx la envía a la API pública con límite equivalente |
+| `/api/alerts/stats` | GET | Sesión y límite `60/min` | Nginx la envía a la API pública con límite equivalente |
 | `/api/alerts/<int:alert_id>` | PUT | Sesión y rol `admin`/`operador` | Nginx la envía a la API protegida |
 | `/api/alerts/mark-all` | PUT | Sesión y rol `admin`/`operador` | Nginx la envía a la API protegida |
 | `/api/alerts/all` | DELETE | Sesión y rol `admin` | Nginx la envía a la API protegida |
@@ -197,7 +197,7 @@ sólo el `bind` del contenedor.
 | `/api/naves/<int:nave_id>` | PUT, DELETE | Sesión y rol `admin` | Nginx la envía a la API protegida |
 | `/api/modulos` | GET | Sesión | Nginx la envía a la API pública |
 | `/api/modulos/<string:codigo>` | PUT | Sesión y rol `admin`/`operador` | Nginx la envía a la API protegida |
-| `/api/parvada/<string:modulo>` | GET | Sesión | Nginx la envía a la API pública |
+| `/api/parvada/<string:modulo>` | GET | Sesión y límite `60/min` | Nginx la envía a la API pública con límite equivalente |
 
 La existencia de un proxy protegido en el dashboard no protege por sí sola una
 ruta homónima que Nginx dirige primero a la API. La columna final documenta esa
@@ -238,9 +238,9 @@ configuración. Los estados son `Mitigado`, `Parcial`, `Aceptado con monitoreo`,
 
 | ID | Riesgo / activo | Inicial | Controles comprobables | Residual | Estado y siguiente acción |
 | --- | --- | :---: | --- | :---: | --- |
-| R-01 | Creación no autorizada de usuarios privilegiados mediante `POST /api/register` | Crítica | Límite `5/hour` y hash fuerte; `/register` del dashboard sólo funciona sin usuarios | **Crítica** | **Abierto:** la API acepta el rol solicitado sin JWT. Restringir a bootstrap controlado o `admin` antes de considerar cerrado |
-| R-02 | Exposición pública de telemetría, alertas y estructura de granjas/naves/módulos | Alta | TLS, métodos GET y sin secretos directos | **Media** | **Parcial:** decidir qué datos son públicos; exigir autenticación o publicar vistas mínimas |
-| R-03 | Divulgación de errores internos mediante `str(e)` | Media | Algunos flujos sensibles ya devuelven errores genéricos y registran la excepción | **Media** | **Abierto:** normalizar respuestas 500 en API y proxies; conservar detalles sólo en logs |
+| R-01 | Creación no autorizada de usuarios privilegiados mediante `POST /api/register` | Crítica | JWT `admin`, MFA verificado, límite `5/hour`, validación, hash fuerte y evento privilegiado | **Baja** | **Mitigado:** conservar pruebas 401/403/201 y revisar cada alta en eventos de seguridad |
+| R-02 | Exposición pública de telemetría, alertas y estructura de granjas/naves/módulos | Alta | TLS, sólo lectura, sin secretos directos, límites por endpoint y límites de resultados | **Media** | **Aceptado con monitoreo:** la compatibilidad del dashboard actual requiere lecturas públicas; no agregar campos personales o secretos y reevaluar autenticación en una versión mayor |
+| R-03 | Divulgación de errores internos mediante detalles de excepciones | Media | Respuestas 500 genéricas en API y dashboard; detalles conservados sólo en logs estructurados del host | **Baja** | **Mitigado:** prueba de regresión impide reintroducir `str(e)` o el secreto de desarrollo |
 | R-04 | Inyección o manipulación de telemetría | Alta | `X-Ingest-Key`, comparación constante, JSON/tipos/rangos, duplicados y auditoría | Baja | **Mitigado:** rotar la llave y vigilar rechazos |
 | R-05 | Fuerza bruta y apropiación de cuentas | Crítica | Hash scrypt, migración PBKDF2, límites, bloqueo persistente, JWT corto y MFA admin | Baja | **Mitigado:** revisar eventos de login y probar recuperación MFA |
 | R-06 | Broken access control en operaciones de escritura | Crítica | JWT/proxy interno, RBAC en backend, campos permitidos y auditoría privilegiada | Baja | **Mitigado:** conservar pruebas por rol y no confiar en controles visuales |
@@ -254,15 +254,17 @@ configuración. Los estados son `Mitigado`, `Parcial`, `Aceptado con monitoreo`,
 | R-14 | Pérdida o corrupción de PostgreSQL | Crítica | Backup diario, flujo 3-2-1 cifrado, restore aislado, RPO 24 h 15 min y RTO 4 h | Media | **Mitigado con ejercicio periódico:** cronometrar recuperación completa y revisar retención |
 | R-15 | Exposición de secretos por Git, evidencias o inspección | Crítica | `.gitignore`, ejemplos sin valores, material TLS fuera del repo y reglas de redacción | Media | **Aceptado con monitoreo:** variables siguen presentes en el entorno de contenedores; limitar acceso al host |
 | R-16 | Caída silenciosa o arranque desordenado | Alta | Healthchecks, dependencias saludables, `restart: unless-stopped` e indicador MQTT | Baja | **Mitigado:** alertar sobre unhealthy/restarts y probar reconexión MQTT |
-| R-17 | Agotamiento por polling o consultas públicas sin límite específico | Alta | Límite global en Flask, salvo endpoints marcados `exempt`; filtros y límites parciales | Media | **Abierto:** aplicar límites/caché/paginación a live-data, historical, alerts y parvada según carga real |
-| R-18 | Configuración insegura al ejecutar el dashboard fuera de Compose | Alta | Compose inyecta `SECRET_KEY` y `FLASK_ENV=production` | Media | **Parcial:** eliminar el fallback `dev-secret-key` o fallar en producción si la llave falta |
+| R-17 | Agotamiento por polling o consultas públicas sin límite específico | Alta | Límites explícitos: ingestión `600/min`, live/última lectura `120/min`, alertas/parvada `60/min` e histórico `30/min`; máximo 1500 puntos históricos | Baja | **Mitigado:** ajustar límites sólo con métricas y conservar la prueba que verifica `429` |
+| R-18 | Configuración insegura al ejecutar el dashboard fuera de Compose | Alta | API y dashboard fallan al iniciar cuando `SECRET_KEY` falta o tiene menos de 32 caracteres | Baja | **Mitigado:** generar una llave distinta por entorno y nunca recuperarla desde valores por defecto |
 
-### 11.1 Riesgos que impiden declarar cierre total
+### 11.1 Cierre residual posterior al commit 30
 
-El commit 30 documenta, pero no corrige, R-01, R-03 y R-17. R-02 y R-18
-requieren una decisión explícita de producto/operación. Estos elementos deben
-permanecer en el backlog y no marcarse como mitigados sólo porque la matriz fue
-publicada.
+El commit de cierre sin numeración corrige R-01, R-03, R-17 y R-18 mediante
+autorización administrativa, redacción de errores, límites específicos y
+configuración fail-closed. R-02 queda aceptado con monitoreo por compatibilidad
+del dashboard actual: únicamente se admiten datos operativos de lectura, bajo
+TLS y límites explícitos. Una futura versión que cambie el contrato del
+dashboard debe reevaluar la autenticación de estas consultas.
 
 ## 12. Trazabilidad de la ruta de hardening
 
@@ -273,7 +275,7 @@ publicada.
 | 3 | 13-16 | Logging estructurado, eventos persistentes, bloqueo de login y auditoría privilegiada |
 | 4 | 17-20 | Hashes, roles, campos MFA y MFA obligatorio para `admin` |
 | 5 | 21-24 | Backup PostgreSQL, 3-2-1 cifrado, restore y retención/RTO/RPO |
-| 6 | 25-30 | Auditoría de dependencias, pinning, contenedores, Nginx, guía de evidencia e inventario final |
+| 6 | 25-30 + cierre | Auditoría de dependencias, pinning, contenedores, Nginx, guía de evidencia, inventario final y corrección de riesgos residuales |
 
 La trazabilidad completa se obtiene con `git log --oneline --decorate`. Los
 merges explícitos a `dev` conservan el límite entre controles.

@@ -94,6 +94,17 @@ def request_source_ip():
     return safe_log_value(request.remote_addr, limit=64)
 
 
+def internal_error_response(message="Error interno del servidor."):
+    """Registrar la excepción activa sin exponer detalles en la respuesta HTTP."""
+    logger.exception(
+        "event=request_processing_failed endpoint=%s method=%s source_ip=%s",
+        safe_log_value(request.endpoint, limit=80),
+        safe_log_value(request.method, limit=16),
+        request_source_ip(),
+    )
+    return jsonify({"error": message}), 500
+
+
 app = Flask(__name__)
 
 environment = os.getenv("FLASK_ENV", "production").lower()
@@ -184,7 +195,7 @@ try:
         valid_window=1,
     )
 except MFAConfigurationError as exc:
-    raise RuntimeError(str(exc)) from exc
+    raise RuntimeError("Configuración MFA inválida.") from exc
 
 app.config.update(
     SECRET_KEY=secret_key,
@@ -208,6 +219,12 @@ CORS(
 
 # Security: Rate Limiting
 # We set a generous global limit but strict limits on sensitive endpoints (login/register)
+TELEMETRY_INGEST_RATE_LIMIT = "600 per minute"
+LIVE_DATA_RATE_LIMIT = "120 per minute"
+HISTORICAL_DATA_RATE_LIMIT = "30 per minute"
+ALERT_QUERY_RATE_LIMIT = "60 per minute"
+PARVADA_QUERY_RATE_LIMIT = "60 per minute"
+
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -1383,7 +1400,7 @@ def validate_ingest_key():
     return hmac.compare_digest(provided_key, expected_key)
 
 @app.route('/lecturas', methods=['POST'])
-@limiter.exempt
+@limiter.limit(TELEMETRY_INGEST_RATE_LIMIT)
 def insert_lectura():
     """Endpoint MQTT insertions with input validation."""
     try:
@@ -1513,6 +1530,7 @@ def insert_lectura():
 
 # ENDPINT to get the last record  
 @app.route('/lecturas', methods=['GET'])
+@limiter.limit(LIVE_DATA_RATE_LIMIT)
 def get_lecturas():
     """Endpoint para obtener lecturas (formato array)"""
     try:
@@ -1542,11 +1560,11 @@ def get_lecturas():
         safe_log_value(locals().get("modulo"), limit=32),
         request_source_ip(),
         )
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 # Live data endpoint for dashboard
 @app.route('/api/live-data', methods=['GET'])
-@limiter.exempt  # Exempt from rate limiting because it's polled frequently
+@limiter.limit(LIVE_DATA_RATE_LIMIT)
 def get_live_data():
     """Endpoint para obtener datos en tiempo real (formato objeto)"""
     try:
@@ -1577,12 +1595,12 @@ def get_live_data():
         safe_log_value(locals().get("modulo"), limit=32),
         request_source_ip(),
         )
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 
 
 @app.route('/api/historical')
-@limiter.exempt
+@limiter.limit(HISTORICAL_DATA_RATE_LIMIT)
 def historical_data():
     try:
         from datetime import datetime, timedelta
@@ -1687,19 +1705,12 @@ def historical_data():
         safe_log_value(locals().get("house_param"), limit=32),
         request_source_ip(),
         )
-        return jsonify({
-            "timestamps": [],
-            "temperature": [],
-            "humidity": [],
-            "ammonia": [],
-            "co": [],
-            "co2": [],
-            "error": str(e)
-        })
+        return internal_error_response()
 
 # User Management Endpoints
 @app.route('/api/register', methods=['POST'])
 @limiter.limit("5 per hour")  # Restrict registration to prevent spam
+@auth_required(roles=["admin"])
 def register_user():
     try:
         data = request.get_json(silent=True)
@@ -1707,24 +1718,49 @@ def register_user():
         if not isinstance(data, dict):
             return jsonify({'error': 'JSON inválido o ausente.'}), 400
 
-        if User.query.filter_by(username=data['username']).first():
+        username = str(data.get('username', '')).strip()
+        password = data.get('password')
+
+        if not username or not isinstance(password, str) or not password:
+            return jsonify({
+                'error': 'username y password son requeridos.'
+            }), 400
+
+        if User.query.filter_by(username=username).first():
             return jsonify({'error': 'Username already exists'}), 400
 
         requested_role = canonicalize_role(data.get('role'))
         
         user = User(
-            username=data['username'],
+            username=username,
             full_name=data.get('full_name', ''),
             role=requested_role,
             initials=data.get('initials', ''),
             profile_image_url=data.get('profile_image_url', '')
         )
-        user.set_password(data['password'])
+        user.set_password(password)
         db.session.add(user)
         db.session.commit()
+
+        record_privileged_action(
+            action='user_created',
+            resource_type='user',
+            resource_id=user.id,
+            changed_fields=['username', 'full_name', 'role', 'initials'],
+            assigned_role=requested_role,
+        )
+
         return jsonify({'msg': 'User registered successfully'}), 201
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except IntegrityError:
+        db.session.rollback()
+        logger.warning(
+            "event=user_registration_rejected reason=integrity_error source_ip=%s",
+            request_audit_source_ip(),
+        )
+        return jsonify({'error': 'No fue posible registrar el usuario.'}), 409
+    except Exception:
+        db.session.rollback()
+        return internal_error_response()
 
 @app.route('/api/login', methods=['POST'])
 @limiter.limit("10 per minute")  # Protección complementaria por IP
@@ -2286,7 +2322,7 @@ def get_umbrales():
             })
         return jsonify(result)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 @app.route('/api/umbrales', methods=['POST'])
 @auth_required(roles=["admin", "operador"])
@@ -2483,7 +2519,7 @@ def get_historical_data(range, from_date=None, to_date=None):
 
 # Alerts API endpoints
 @app.route('/api/alerts', methods=['GET'])
-@limiter.exempt
+@limiter.limit(ALERT_QUERY_RATE_LIMIT)
 def get_alerts():
     """Get all alerts with filtering options"""
     try:
@@ -2543,7 +2579,7 @@ def get_alerts():
         safe_log_value(locals().get("modulo"), limit=32),
         request_source_ip(),
         )
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 @app.route('/api/alerts/<int:alert_id>', methods=['PUT'])
 @auth_required(roles=["admin", "operador"])
@@ -2592,6 +2628,7 @@ def update_alert(alert_id):
 
 
 @app.route('/api/alerts/stats', methods=['GET'])
+@limiter.limit(ALERT_QUERY_RATE_LIMIT)
 def get_alert_stats():
     """Get alert statistics"""
     try:
@@ -2611,7 +2648,7 @@ def get_alert_stats():
         "event=alert_stats_query_failed source_ip=%s",
         request_source_ip(),
         )
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 @app.route('/api/alerts/mark-all', methods=['PUT'])
 @auth_required(roles=["admin", "operador"])
@@ -2817,7 +2854,7 @@ def get_granjas():
             })
         return jsonify(result)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 @app.route('/api/granjas', methods=['POST'])
 @auth_required(roles=["admin"])
@@ -2854,7 +2891,7 @@ def create_granja():
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 
 @app.route('/api/granjas/<int:granja_id>', methods=['PUT'])
@@ -2891,7 +2928,7 @@ def update_granja(granja_id):
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 
 @app.route('/api/granjas/<int:granja_id>', methods=['DELETE'])
@@ -2919,7 +2956,7 @@ def delete_granja(granja_id):
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 
 # -------------------------------------------------------
@@ -2948,7 +2985,7 @@ def get_naves():
             })
         return jsonify(result)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 @app.route('/api/naves', methods=['POST'])
 @auth_required(roles=["admin"])
@@ -2999,7 +3036,7 @@ def create_nave():
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 
 @app.route('/api/naves/<int:nave_id>', methods=['PUT'])
@@ -3047,7 +3084,7 @@ def update_nave(nave_id):
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 
 @app.route('/api/naves/<int:nave_id>', methods=['DELETE'])
@@ -3078,7 +3115,7 @@ def delete_nave(nave_id):
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 
 # -------------------------------------------------------
@@ -3119,7 +3156,7 @@ def get_modulos():
             })
         return jsonify(result)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 @app.route('/api/modulos/<string:codigo>', methods=['PUT'])
 @auth_required(roles=["admin", "operador"])
@@ -3165,7 +3202,7 @@ def update_modulo(codigo):
 
     except Exception as e:
         db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 
 # -------------------------------------------------------
@@ -3173,7 +3210,7 @@ def update_modulo(codigo):
 # -------------------------------------------------------
 
 @app.route('/api/parvada/<string:modulo_codigo>', methods=['GET'])
-@limiter.exempt
+@limiter.limit(PARVADA_QUERY_RATE_LIMIT)
 def get_parvada(modulo_codigo):
     try:
         m = Modulo.query.filter_by(codigo=modulo_codigo).first()
@@ -3192,7 +3229,7 @@ def get_parvada(modulo_codigo):
             'granja': granja_data
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return internal_error_response()
 
 
 def start(port=5000, host='0.0.0.0'):

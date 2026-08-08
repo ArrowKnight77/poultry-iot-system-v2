@@ -2,10 +2,11 @@
 
 ## 1. Propósito
 
-Esta guía cierra el commit 29 de la fase 6 y reúne un procedimiento reproducible
-para validar, integrar y desplegar los controles de los commits 25 a 28. También
-define qué evidencia puede conservarse, cómo nombrarla y cómo resolver los
-errores operativos más comunes sin exponer secretos.
+Esta guía nació en el commit 29 de la fase 6 y reúne un procedimiento
+reproducible para validar, integrar y desplegar los controles de los commits 25
+a 30 y el cierre residual posterior. También define qué evidencia puede
+conservarse, cómo nombrarla y cómo resolver los errores operativos más comunes
+sin exponer secretos.
 
 El commit 29 es exclusivamente documental. Después de integrarlo en `dev`, el
 Droplet sólo necesita actualizar su checkout de Git. No requiere reconstruir
@@ -17,6 +18,8 @@ Las guías técnicas especializadas continúan siendo la referencia detallada:
 - [dependencias reproducibles](dependency-pinning.md);
 - [hardening básico de contenedores](container-hardening.md);
 - [cabeceras de seguridad y HSTS](nginx-security-headers.md);
+- [inventario de endpoints y matriz de riesgos](endpoint-inventory-risk-matrix.md);
+- [cierre final sin numeración](hardening-final-closure.md);
 - [continuidad, retención y RTO/RPO](backup-retention-rto-rpo.md).
 
 ## 2. Alcance y criterios de cierre
@@ -30,6 +33,8 @@ La guía cubre los siguientes controles:
 | 27 | Hardening de contenedores | Usuario no root, filesystem de solo lectura, privilegios reducidos y healthchecks |
 | 28 | Nginx y HSTS | Sintaxis válida, HTTPS con cabeceras únicas y HTTP sin HSTS |
 | 29 | Guía y evidencia | Procedimiento ejecutable, capturas seguras, rollback y errores comunes documentados |
+| 30 | Inventario y riesgos | Rutas, puertos, tópicos, controles y riesgos residuales trazables |
+| Cierre | Remediación residual | Registro administrativo, errores redactados, polling limitado y secretos fail-closed |
 
 El commit 29 se considera listo cuando:
 
@@ -102,7 +107,7 @@ capturas autorizadas.
 | E29-06 | Nginx y cabeceras | `validate_nginx_config.sh` y `check_nginx_security_headers.sh` | Sintaxis correcta y cabeceras públicas sin duplicados |
 | E29-07 | Login y MFA | Navegador sobre HTTPS | Login administrativo exige contraseña y TOTP válidos |
 | E29-08 | Eventos de seguridad | Vista autenticada `/security-events` | Eventos visibles sin romper sesión ni MFA |
-| E29-09 | Salud productiva | `docker compose ps`, reinicios y logs recientes | Cinco servicios saludables, `restart=0` y sin errores nuevos |
+| E29-09 | Salud productiva | `docker compose ps`, reinicios y logs recientes | Cinco servicios saludables y sin reinicios nuevos; anotar por separado cualquier contador histórico |
 | E29-10 | Rollback y respaldo | Rama de rollback y respaldo Nginx/continuidad | Punto de recuperación identificable sin mostrar secretos |
 
 ## 5. Preparación local en WSL
@@ -498,3 +503,18 @@ El cierre global de superficies, roles, puertos y riesgos se conserva en el
 [inventario de endpoints y matriz de riesgos](endpoint-inventory-risk-matrix.md).
 Ese inventario debe actualizarse cuando cambie una ruta, un método, un puerto,
 un tópico MQTT o el estado residual de un riesgo.
+
+## 14. Extensión de cierre posterior al commit 30
+
+La plantilla DOCX continúa usando los espacios E29-01 a E29-10 porque fueron
+reservados por la guía original. Para la entrega final deben interpretarse como
+evidencia global de Fase 6: E29-01 registra la rama y SHA del cierre; E29-04
+incluye las pruebas de autorización, redacción y rate limit; E29-09 confirma el
+runtime reconstruido en el Droplet; y E29-10 conserva el SHA de rollback previo
+al despliegue final.
+
+A diferencia del commit 29, el cierre residual sí modifica API y dashboard.
+Por ello requiere reconstruir `api` y `dashboard`, recrear
+`mqtt_subscriber` por su dependencia del API y confirmar los cinco servicios
+saludables. Los comandos y respuestas esperadas se conservan en la
+[guía de cierre final](hardening-final-closure.md).

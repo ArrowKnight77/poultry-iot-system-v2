@@ -48,7 +48,14 @@ dashboard_session_expires_minutes = read_bounded_int(
 )
 
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key')
+dashboard_secret_key = os.getenv('SECRET_KEY')
+if not dashboard_secret_key or len(dashboard_secret_key) < 32:
+    raise RuntimeError(
+        'SECRET_KEY no definida o demasiado corta. '
+        'Debe tener al menos 32 caracteres.'
+    )
+
+app.secret_key = dashboard_secret_key
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config.update(
@@ -62,6 +69,11 @@ app.config.update(
 )
 
 # Security: Rate Limiting
+DASHBOARD_POLLING_RATE_LIMIT = "120 per minute"
+DASHBOARD_HISTORICAL_RATE_LIMIT = "30 per minute"
+DASHBOARD_ALERT_RATE_LIMIT = "60 per minute"
+DASHBOARD_PARVADA_RATE_LIMIT = "60 per minute"
+
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -723,10 +735,14 @@ def register():
             flash('Usuario registrado exitosamente. Ahora puede iniciar sesión.')
             return redirect('/login')
             
-        except Exception as e:
+        except Exception:
             db.session.rollback()
-            flash(f'Error al registrar usuario: {str(e)}')
-            print(f"Error en registro: {e}")
+            app.logger.exception(
+                "event=dashboard_registration_failed endpoint=%s source_ip=%s",
+                request.endpoint,
+                request.remote_addr,
+            )
+            flash('Error interno al registrar usuario. Intente nuevamente.')
             return render_template('login.html', show_register=True)
     
     # Verificar si ya hay usuarios
@@ -772,6 +788,7 @@ def dashboard():
 
 @app.route('/api/historical')
 @login_required
+@limiter.limit(DASHBOARD_HISTORICAL_RATE_LIMIT)
 def api_historical():
     """Endpoint proxy para datos históricos - funciona desde cualquier dispositivo"""
     try:
@@ -797,22 +814,12 @@ def api_historical():
                 "error": "No hay datos disponibles"
             })
             
-    except Exception as e:
-        print(f"Error api_historical: {e}")
-        return jsonify({
-            "timestamps": [],
-            "house": [],
-            "temperature": [],
-            "humidity": [],
-            "ammonia": [],
-            "co": [],
-            "co2": [],
-            "oxygen": [],
-            "error": str(e)
-        }), 500
+    except Exception:
+        return _dashboard_internal_error()
 
 @app.route('/api/live-data')
 @login_required
+@limiter.limit(DASHBOARD_POLLING_RATE_LIMIT)
 def api_live_data():
     """Proxy autenticado para datos en tiempo real."""
     try:
@@ -824,7 +831,7 @@ def api_live_data():
         )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/umbrales', methods=['GET', 'POST'])
@@ -853,7 +860,7 @@ def api_umbrales():
 
         return jsonify(r.json()), r.status_code
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 def _api_url():
@@ -890,6 +897,17 @@ def _proxy_json_response(response):
         }), response.status_code
 
 
+def _dashboard_internal_error(message='Error interno del dashboard.'):
+    """Registrar la excepción activa sin devolver detalles al navegador."""
+    app.logger.exception(
+        "event=dashboard_request_failed endpoint=%s method=%s source_ip=%s",
+        request.endpoint,
+        request.method,
+        request.remote_addr,
+    )
+    return jsonify({'error': message}), 500
+
+
 @app.route('/dashboard-api/user/<int:user_id>', methods=['GET', 'PUT'])
 @app.route('/api/user/<int:user_id>', methods=['GET', 'PUT'])
 @login_required
@@ -911,11 +929,12 @@ def proxy_user(user_id):
 
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/alerts', methods=['GET'])
 @login_required
+@limiter.limit(DASHBOARD_ALERT_RATE_LIMIT)
 def proxy_alerts():
     try:
         r = requests.get(
@@ -926,11 +945,12 @@ def proxy_alerts():
         )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/alerts/stats', methods=['GET'])
 @login_required
+@limiter.limit(DASHBOARD_ALERT_RATE_LIMIT)
 def proxy_alert_stats():
     try:
         r = requests.get(
@@ -940,7 +960,7 @@ def proxy_alert_stats():
         )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/alerts/<int:alert_id>', methods=['PUT'])
@@ -959,7 +979,7 @@ def proxy_alert(alert_id):
         )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/alerts/mark-all', methods=['PUT'])
@@ -977,7 +997,7 @@ def proxy_mark_all_alerts():
         )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/alerts/all', methods=['DELETE'])
@@ -995,7 +1015,7 @@ def proxy_delete_all_alerts():
         )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/alerts/check', methods=['POST'])
@@ -1013,7 +1033,7 @@ def proxy_alert_check():
         )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/security-events', methods=['GET'])
@@ -1058,7 +1078,7 @@ def proxy_granjas():
             )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/granjas/<int:granja_id>', methods=['PUT', 'DELETE'])
@@ -1084,7 +1104,7 @@ def proxy_granja(granja_id):
             )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/naves', methods=['GET', 'POST'])
@@ -1112,7 +1132,7 @@ def proxy_naves():
             )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/naves/<int:nave_id>', methods=['PUT', 'DELETE'])
@@ -1138,7 +1158,7 @@ def proxy_nave(nave_id):
             )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/modulos', methods=['GET'])
@@ -1152,7 +1172,7 @@ def proxy_modulos():
         )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/modulos/<string:codigo>', methods=['PUT'])
@@ -1171,11 +1191,12 @@ def proxy_modulo(codigo):
         )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 @app.route('/api/parvada/<string:modulo>')
 @login_required
+@limiter.limit(DASHBOARD_PARVADA_RATE_LIMIT)
 def proxy_parvada(modulo):
     try:
         r = requests.get(
@@ -1185,7 +1206,7 @@ def proxy_parvada(modulo):
         )
         return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
 
 
 #Redirigir la raíz '/' al login
