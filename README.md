@@ -79,8 +79,11 @@ The final hardening inventory maps the public and internal HTTP routes, Docker
 and host ports, MQTT topics, authentication models, RBAC decisions and
 residual risks. See the
 [endpoint inventory and risk matrix](docs/endpoint-inventory-risk-matrix.md)
-for the source-of-truth precedence, validation commands and open remediation
-items that must not be treated as mitigated.
+for the source-of-truth precedence, validation commands and residual-risk
+decisions. The unnumbered remediation is recorded in the
+[final hardening closure](docs/hardening-final-closure.md). The Phase 6 Word
+template with ten reserved screenshot spaces is stored in
+[`docs/evidence/commit29/`](docs/evidence/commit29/).
 
 ## PostgreSQL backup
 
