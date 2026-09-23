@@ -78,3 +78,12 @@ mosquitto/config/passwd
 # Local MQTT TLS material
 mosquitto/certs/
 .venv-simulator/
+
+# Agente de pentesting (Pentesting/)
+Pentesting/.venv/
+Pentesting/.env
+Pentesting/results/
+Pentesting/reports/
+Pentesting/__pycache__/
+Pentesting/scenarios/__pycache__/
+Pentesting/*.pyc
