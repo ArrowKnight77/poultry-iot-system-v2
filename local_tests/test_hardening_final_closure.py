@@ -155,7 +155,8 @@ class ErrorRedactionAndRateLimitTests(unittest.TestCase):
         client = api.app.test_client()
         responses = [client.get("/api/live-data") for _ in range(121)]
 
-        self.assertEqual(responses[0].status_code, 200)
+        # Las lecturas ya exigen autenticación; el límite sigue aplicando antes.
+        self.assertEqual(responses[0].status_code, 401)
         self.assertEqual(responses[-1].status_code, 429)
 
 
