@@ -87,3 +87,6 @@ Pentesting/reports/
 Pentesting/__pycache__/
 Pentesting/scenarios/__pycache__/
 Pentesting/*.pyc
+docs/evidence/*.patch
+/docs/evidence/
+*.docx
