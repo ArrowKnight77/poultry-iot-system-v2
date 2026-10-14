@@ -1,13 +1,27 @@
-from flask import Flask, render_template, request, redirect, flash, jsonify
+from flask import (
+    Flask,
+    abort,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, login_user, logout_user, login_required, UserMixin, current_user
 from flask_cors import CORS, cross_origin
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
+import base64
+from functools import wraps
+from io import BytesIO
 import os
 import requests
 import json
-from datetime import datetime
+import qrcode
+from datetime import datetime, timedelta
 
 
 
@@ -16,12 +30,55 @@ from flask_limiter.util import get_remote_address
 
 load_dotenv()
 
+
+def read_bounded_int(name, default, minimum, maximum):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+
+    return min(max(value, minimum), maximum)
+
+
+dashboard_session_expires_minutes = read_bounded_int(
+    "DASHBOARD_SESSION_EXPIRES_MINUTES",
+    default=60,
+    minimum=15,
+    maximum=1440,
+)
+
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key')
+
+# Nginx es el unico proxy de confianza delante del dashboard.
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+dashboard_secret_key = os.getenv('SECRET_KEY')
+if not dashboard_secret_key or len(dashboard_secret_key) < 32:
+    raise RuntimeError(
+        'SECRET_KEY no definida o demasiado corta. '
+        'Debe tener al menos 32 caracteres.'
+    )
+
+app.secret_key = dashboard_secret_key
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=(os.getenv("FLASK_ENV", "production").lower() == "production"),
+    PERMANENT_SESSION_LIFETIME=timedelta(
+        minutes=dashboard_session_expires_minutes
+    ),
+    SESSION_REFRESH_EACH_REQUEST=False,
+)
 
 # Security: Rate Limiting
+DASHBOARD_POLLING_RATE_LIMIT = "120 per minute"
+DASHBOARD_HISTORICAL_RATE_LIMIT = "30 per minute"
+DASHBOARD_ALERT_RATE_LIMIT = "60 per minute"
+DASHBOARD_PARVADA_RATE_LIMIT = "60 per minute"
+
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -35,10 +92,129 @@ def add_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
     response.headers['X-XSS-Protection'] = '1; mode=block'
+
+    if request.endpoint == "login":
+        response.headers["Cache-Control"] = "no-store"
+
     return response
 
 db = SQLAlchemy(app)
-CORS(app)
+
+
+@app.get('/health')
+@limiter.exempt
+def health_check():
+    """Exponer una comprobación mínima sin datos ni autenticación."""
+    return jsonify({'status': 'ok'}), 200
+
+PASSWORD_HASH_METHOD = "scrypt"
+PASSWORD_HASH_SALT_LENGTH = 16
+SUPPORTED_PASSWORD_HASH_PREFIXES = ("scrypt:", "pbkdf2:")
+CANONICAL_ROLES = ("admin", "operador", "visor")
+DEFAULT_USER_ROLE = "visor"
+ROLE_ALIASES = {
+    "admin": "admin",
+    "administrator": "admin",
+    "administrador": "admin",
+    "operador": "operador",
+    "operator": "operador",
+    "visor": "visor",
+    "viewer": "visor",
+    "user": "visor",
+    "usuario": "visor",
+}
+ROLE_PERMISSIONS = {
+    "admin": {
+        "update_thresholds": True,
+        "manage_alerts": True,
+        "delete_alerts": True,
+        "manage_infrastructure": True,
+        "assign_modules": True,
+        "view_security_events": True,
+    },
+    "operador": {
+        "update_thresholds": True,
+        "manage_alerts": True,
+        "delete_alerts": False,
+        "manage_infrastructure": False,
+        "assign_modules": True,
+        "view_security_events": True,
+    },
+    "visor": {
+        "update_thresholds": False,
+        "manage_alerts": False,
+        "delete_alerts": False,
+        "manage_infrastructure": False,
+        "assign_modules": False,
+        "view_security_events": False,
+    },
+}
+
+
+def generate_secure_password_hash(password):
+    return generate_password_hash(
+        password,
+        method=PASSWORD_HASH_METHOD,
+        salt_length=PASSWORD_HASH_SALT_LENGTH,
+    )
+
+
+def is_supported_password_hash(password_hash):
+    if not isinstance(password_hash, str):
+        return False
+
+    if password_hash != password_hash.strip() or any(
+        char.isspace()
+        for char in password_hash
+    ):
+        return False
+
+    if not password_hash.startswith(SUPPORTED_PASSWORD_HASH_PREFIXES):
+        return False
+
+    return password_hash.count("$") >= 2
+
+
+def verify_password_hash(password_hash, password):
+    if not is_supported_password_hash(password_hash):
+        return False
+
+    try:
+        return check_password_hash(password_hash, password)
+    except (TypeError, ValueError):
+        return False
+
+
+def normalize_role(role):
+    raw_role = (role or "").strip().casefold()
+
+    if not raw_role:
+        return DEFAULT_USER_ROLE
+
+    return ROLE_ALIASES.get(raw_role, DEFAULT_USER_ROLE)
+
+
+def permissions_for_role(role):
+    normalized_role = normalize_role(role)
+    return dict(ROLE_PERMISSIONS[normalized_role])
+
+
+dashboard_cors_origins_raw = os.getenv(
+    "DASHBOARD_CORS_ORIGINS",
+    "http://localhost:5000,http://localhost:5001"
+)
+
+dashboard_cors_origins = [
+    origin.strip()
+    for origin in dashboard_cors_origins_raw.split(",")
+    if origin.strip()
+]
+
+CORS(
+    app,
+    origins=dashboard_cors_origins,
+    supports_credentials=True
+)
 
 login_manager = LoginManager()
 login_manager.login_view = 'login'
@@ -49,19 +225,112 @@ class User(UserMixin, db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)
+    password_hash = db.Column(db.String(512), nullable=False)
     full_name = db.Column(db.String(120))
-    role = db.Column(db.String(50))
+    role = db.Column(
+        db.String(20),
+        nullable=False,
+        default=DEFAULT_USER_ROLE,
+    )
     initials = db.Column(db.String(10))
     profile_image_url = db.Column(db.String(500))
+    mfa_enabled = db.Column(
+        db.Boolean,
+        nullable=False,
+        default=False,
+    )
+    mfa_secret_encrypted = db.Column(db.String(512))
+    mfa_enrolled_at = db.Column(db.DateTime)
+    mfa_last_verified_at = db.Column(db.DateTime)
+    session_epoch = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+
+    def get_id(self):
+        # La cookie queda ligada a la "epoca" de sesion vigente del usuario.
+        return f"{self.id}:{self.session_epoch or 0}"
     
     def set_password(self, password):
-        """Hash the password and store it"""
-        self.password_hash = generate_password_hash(password)
+        """Hash the password and store it."""
+        self.password_hash = generate_secure_password_hash(password)
     
     def check_password(self, password):
-        """Check if the provided password matches the hash"""
-        return check_password_hash(self.password_hash, password)
+        """Check if the provided password matches a supported hash."""
+        return verify_password_hash(self.password_hash, password)
+
+    def normalized_role(self):
+        return normalize_role(self.role)
+
+    def has_complete_mfa_enrollment(self):
+        return bool(
+            self.mfa_enabled
+            and self.mfa_secret_encrypted
+            and self.mfa_enrolled_at
+        )
+
+
+def serialize_dashboard_user(user):
+    """Expose only presentation-safe identity and authorization state."""
+    role = user.normalized_role()
+
+    return {
+        'id': user.id,
+        'username': user.username,
+        'full_name': user.full_name,
+        'role': role,
+        'initials': user.initials,
+        'profile_image_url': user.profile_image_url,
+        'mfa_required': role == 'admin',
+        'mfa_enabled': bool(user.mfa_enabled),
+        'mfa_enrolled': user.has_complete_mfa_enrollment(),
+        'mfa_last_verified_at': (
+            user.mfa_last_verified_at.isoformat()
+            if user.mfa_last_verified_at
+            else None
+        ),
+        'permissions': permissions_for_role(role),
+        'session_expires_minutes': dashboard_session_expires_minutes,
+    }
+
+
+def is_dashboard_api_request():
+    return request.path.startswith(('/api/', '/dashboard-api/'))
+
+
+def forbidden_json_response():
+    return jsonify({
+        'error': 'Permisos insuficientes.',
+        'details': [
+            'Tu rol no permite realizar esta acción.'
+        ],
+        'code': 'forbidden',
+    }), 403
+
+
+def require_dashboard_roles(*allowed_roles):
+    allowed = {normalize_role(role) for role in allowed_roles}
+
+    if current_user.normalized_role() in allowed:
+        return None
+
+    return forbidden_json_response()
+
+
+def dashboard_roles_required(*allowed_roles):
+    allowed = {normalize_role(role) for role in allowed_roles}
+
+    def decorator(view):
+        @wraps(view)
+        @login_required
+        def wrapped(*args, **kwargs):
+            if current_user.normalized_role() not in allowed:
+                if is_dashboard_api_request():
+                    return forbidden_json_response()
+                abort(403)
+
+            return view(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
 
 # No crear usuarios automáticamente
 # El primer usuario debe registrarse manualmente
@@ -75,7 +344,76 @@ except Exception as e:
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    raw_id, _, raw_epoch = str(user_id).partition(":")
+
+    try:
+        user = db.session.get(User, int(raw_id))
+    except (TypeError, ValueError):
+        return None
+
+    # Una cookie emitida antes del ultimo logout ya no carga al usuario.
+    if user is None or str(user.session_epoch or 0) != raw_epoch:
+        return None
+
+    return user
+
+
+@login_manager.unauthorized_handler
+def unauthorized():
+    if is_dashboard_api_request():
+        return jsonify({
+            'error': 'La sesión expiró. Inicia sesión nuevamente.',
+            'code': 'session_expired',
+        }), 401
+
+    return redirect(url_for('login'))
+
+
+@app.errorhandler(403)
+def forbidden_page(_error):
+    if is_dashboard_api_request():
+        return forbidden_json_response()
+
+    user_data = (
+        serialize_dashboard_user(current_user)
+        if current_user.is_authenticated
+        else None
+    )
+    return render_template(
+        'error_403.html',
+        user_data=user_data,
+    ), 403
+
+
+@app.before_request
+def enforce_admin_mfa_session():
+    if not current_user.is_authenticated:
+        return None
+
+    if current_user.normalized_role() != "admin":
+        return None
+
+    verified_user_id = session.get("mfa_verified_user_id")
+    if (
+        verified_user_id == current_user.id
+        and current_user.has_complete_mfa_enrollment()
+    ):
+        return None
+
+    logout_user()
+    session.clear()
+
+    if request.endpoint == "login":
+        return None
+
+    if is_dashboard_api_request():
+        return jsonify({
+            'error': 'La sesión administrativa requiere verificación MFA.',
+            'code': 'mfa_required',
+        }), 401
+
+    flash("La sesión administrativa requiere verificación MFA.")
+    return redirect("/login")
 
 def get_live_data():
     """Obtiene datos en tiempo real desde la API del dashboard"""
@@ -88,7 +426,7 @@ def get_live_data():
         timestamp = int(time.time())
         url = f'{api_url}/api/live-data?t={timestamp}'
         
-        response = requests.get(url, timeout=5)
+        response = requests.get(url, headers=_dashboard_proxy_headers(), timeout=5)
         print(f"🔍 Estado API Dashboard: {response.status_code} - URL: {url}")
         
         if response.status_code == 200:
@@ -121,7 +459,7 @@ def get_historical_data_from_api(range_param, from_date=None, to_date=None, hous
         if house_param:
             url += f'&house={house_param}'
         
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, headers=_dashboard_proxy_headers(), timeout=10)
         if response.status_code == 200:
             return response.json()
         else:
@@ -136,7 +474,7 @@ def get_umbrales_from_api():
     try:
         api_url = os.getenv('API_BASE_URL', 'http://localhost:5000')
         url = f'{api_url}/api/umbrales'
-        response = requests.get(url, timeout=5)
+        response = requests.get(url, headers=_dashboard_proxy_headers(), timeout=5)
         if response.status_code == 200:
             return response.json()
         return []
@@ -144,21 +482,234 @@ def get_umbrales_from_api():
         print(f"❌ Error obteniendo umbrales: {e}")
         return []
 
+
+def dashboard_auth_headers():
+    proxy_key = os.getenv("DASHBOARD_PROXY_KEY", "")
+    headers = {}
+
+    if proxy_key:
+        headers["X-Dashboard-Proxy-Key"] = proxy_key
+        headers["X-Dashboard-Source-IP"] = request.remote_addr or ""
+
+    return headers
+
+
+def build_mfa_qr_data_uri(provisioning_uri):
+    if not isinstance(provisioning_uri, str) or not provisioning_uri.startswith(
+        "otpauth://totp/"
+    ):
+        return None
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=6,
+        border=4,
+    )
+    qr.add_data(provisioning_uri)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    encoded_image = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded_image}"
+
+
+def render_mfa_challenge(response_data):
+    challenge_token = response_data.get("challenge_token", "")
+    setup_required = bool(response_data.get("mfa_setup_required"))
+    api_user = response_data.get("user") or {}
+
+    if (
+        not isinstance(challenge_token, str)
+        or not challenge_token
+        or len(challenge_token) > 4096
+        or not isinstance(api_user, dict)
+    ):
+        flash("No fue posible iniciar el reto MFA. Intente nuevamente.")
+        return render_template("login.html")
+
+    qr_data_uri = None
+    manual_entry_key = None
+
+    if setup_required:
+        manual_entry_key = response_data.get("manual_entry_key", "")
+        provisioning_uri = response_data.get("provisioning_uri", "")
+        qr_data_uri = build_mfa_qr_data_uri(provisioning_uri)
+
+        if (
+            not qr_data_uri
+            or not isinstance(manual_entry_key, str)
+            or not manual_entry_key
+        ):
+            flash("No fue posible preparar el enrolamiento MFA.")
+            return render_template("login.html")
+
+    challenge_expires_in = response_data.get("challenge_expires_in", 300)
+    try:
+        challenge_expires_in = int(challenge_expires_in)
+    except (TypeError, ValueError):
+        challenge_expires_in = 300
+
+    challenge_expires_in = min(max(challenge_expires_in, 60), 900)
+
+    if response_data.get("error"):
+        flash(str(response_data["error"])[:200])
+
+    return render_template(
+        "login.html",
+        mfa_step=True,
+        mfa_setup_required=setup_required,
+        mfa_challenge_token=challenge_token,
+        mfa_username=str(api_user.get("username", ""))[:80],
+        mfa_qr_data_uri=qr_data_uri,
+        mfa_manual_entry_key=manual_entry_key,
+        mfa_challenge_expires_in=challenge_expires_in,
+    )
+
+
+def complete_dashboard_login(response_data):
+    api_user = response_data.get("user", {})
+    user_id = api_user.get("id") if isinstance(api_user, dict) else None
+    user = db.session.get(User, user_id) if user_id else None
+
+    if not user:
+        app.logger.error(
+            "dashboard_login_user_not_found user_id=%s",
+            user_id,
+        )
+        flash("No fue posible iniciar la sesión. Contacte al administrador.")
+        return render_template("login.html")
+
+    if (
+        user.normalized_role() == "admin"
+        and (
+            response_data.get("mfa_verified") is not True
+            or not user.has_complete_mfa_enrollment()
+        )
+    ):
+        app.logger.error(
+            "dashboard_admin_login_missing_mfa user_id=%s",
+            user.id,
+        )
+        flash("La sesión administrativa requiere verificación MFA.")
+        return render_template("login.html")
+
+    session.clear()
+    session.permanent = True
+    login_user(user, remember=False, fresh=True)
+
+    if user.normalized_role() == "admin":
+        session["mfa_verified_user_id"] = user.id
+
+    return redirect("/dashboard")
+
 @app.route('/login', methods=['GET', 'POST'])
 @limiter.limit("10 per minute")
 def login():
+    if request.method == 'GET' and current_user.is_authenticated:
+        return redirect('/dashboard')
+
     if request.method == 'POST':
+        api_url = os.getenv("API_BASE_URL", "http://api:5000").rstrip("/")
+        challenge_token = request.form.get(
+            "mfa_challenge_token",
+            "",
+        ).strip()
+
+        if challenge_token:
+            code = request.form.get("totp_code", "").strip()
+
+            if not code:
+                flash("El código MFA es requerido.")
+                return render_template("login.html")
+
+            endpoint = f"{api_url}/api/mfa/verify"
+            payload = {
+                "challenge_token": challenge_token,
+                "code": code,
+            }
+        else:
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
+
+            if not username or not password:
+                flash("Usuario y contraseña son requeridos.")
+                return render_template("login.html")
+
+            endpoint = f"{api_url}/api/login"
+            payload = {
+                "username": username,
+                "password": password,
+            }
+
         try:
-            user = User.query.filter_by(username=request.form['username']).first()
-            if user and user.check_password(request.form['password']):
-                login_user(user)
-                return redirect('/dashboard')
-            flash('Usuario o contraseña incorrectos')
-        except Exception as e:
-            flash('Error en el sistema. Intente nuevamente.')
-            print(f"Error en login: {e}")
-    
-    return render_template('login.html')
+            api_response = requests.post(
+                endpoint,
+                json=payload,
+                headers=dashboard_auth_headers(),
+                timeout=5,
+            )
+        except requests.RequestException as exc:
+            app.logger.warning(
+                "dashboard_login_api_unavailable error_type=%s",
+                type(exc).__name__,
+            )
+            flash("No fue posible validar las credenciales. Intente nuevamente.")
+            return render_template("login.html")
+
+        try:
+            response_data = api_response.json()
+        except ValueError:
+            response_data = {}
+
+        if api_response.status_code == 200:
+            return complete_dashboard_login(response_data)
+
+        if (
+            api_response.status_code in (202, 401)
+            and response_data.get("mfa_required") is True
+        ):
+            return render_mfa_challenge(response_data)
+
+        if api_response.status_code == 429:
+            raw_retry_after = response_data.get(
+                "retry_after_seconds",
+                api_response.headers.get("Retry-After", "60"),
+            )
+
+            try:
+                retry_after_seconds = int(raw_retry_after)
+            except (TypeError, ValueError):
+                retry_after_seconds = 60
+
+            retry_after_seconds = min(max(retry_after_seconds, 1), 86400)
+
+            return render_template(
+                "login.html",
+                lockout_seconds=retry_after_seconds,
+            )
+
+        if challenge_token and api_response.status_code in (400, 401):
+            flash(
+                str(response_data.get("error") or "El reto MFA expiró.")[:200]
+            )
+        elif api_response.status_code in (400, 401):
+            flash("Usuario o contraseña incorrectos")
+        else:
+            app.logger.warning(
+                "dashboard_login_api_error status=%s",
+                api_response.status_code,
+            )
+            flash("Error en el sistema. Intente nuevamente.")
+
+    return render_template(
+        "login.html",
+        session_expired=(
+            request.args.get('reason') == 'session-expired'
+        ),
+    )
+
 
 @app.route('/register', methods=['GET', 'POST'])
 @limiter.limit("5 per hour")
@@ -179,14 +730,14 @@ def register():
                 flash('Las contraseñas no coinciden')
                 return render_template('login.html', show_register=True)
             
-            if len(password) < 6:
-                flash('La contraseña debe tener al menos 6 caracteres')
+            if len(password) < 12:
+                flash('La contraseña debe tener al menos 12 caracteres')
                 return render_template('login.html', show_register=True)
             
             # Crear usuario
             username = request.form['username']
             full_name = request.form['full_name']
-            role = request.form.get('role', 'User')
+            role = normalize_role(request.form.get('role'))
             
             # Generar iniciales
             initials = ''.join([n[0].upper() for n in full_name.split()])[:2]
@@ -205,10 +756,14 @@ def register():
             flash('Usuario registrado exitosamente. Ahora puede iniciar sesión.')
             return redirect('/login')
             
-        except Exception as e:
+        except Exception:
             db.session.rollback()
-            flash(f'Error al registrar usuario: {str(e)}')
-            print(f"Error en registro: {e}")
+            app.logger.exception(
+                "event=dashboard_registration_failed endpoint=%s source_ip=%s",
+                request.endpoint,
+                request.remote_addr,
+            )
+            flash('Error interno al registrar usuario. Intente nuevamente.')
             return render_template('login.html', show_register=True)
     
     # Verificar si ya hay usuarios
@@ -223,10 +778,14 @@ def register():
     
     return render_template('login.html', show_register=True)
 
-@app.route('/logout')
+@app.route('/logout', methods=['POST'])
 @login_required
 def logout():
+    # Invalidar en servidor todas las cookies emitidas para este usuario.
+    current_user.session_epoch = (current_user.session_epoch or 0) + 1
+    db.session.commit()
     logout_user()
+    session.clear()
     return redirect('/login')
 
 #pestañas de dashboard
@@ -244,37 +803,28 @@ def dashboard():
         flash('Base de datos no disponible. Espere a que el sistema inicie completamente.')
         return redirect('/login')
     
-    # DEBUG: Verificar estado del usuario actual
-    print(f"DEBUG: current_user is_authenticated: {current_user.is_authenticated}")
-    print(f"DEBUG: current_user id: {getattr(current_user, 'id', 'None')}")
-    print(f"DEBUG: current_user username: {getattr(current_user, 'username', 'None')}")
-    
-    # Pasar datos del usuario a la plantilla
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.role,
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    
-    print(f"DEBUG: user_data being passed: {user_data}")
-    
-    return render_template('dashboard.html', user_data=user_data)
+    return render_template(
+        'dashboard.html',
+        active='dashboard',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 
 @app.route('/api/historical')
+@login_required
+@limiter.limit(DASHBOARD_HISTORICAL_RATE_LIMIT)
 def api_historical():
     """Endpoint proxy para datos históricos - funciona desde cualquier dispositivo"""
     try:
-        range_param = request.args.get('range', '24h')
-        from_date = request.args.get('from', None)
-        to_date = request.args.get('to', None)
-        house_param = request.args.get('house', None)
-        
-        data = get_historical_data_from_api(range_param, from_date, to_date, house_param)
-        
+        # Reenviar los mismos parametros que manda el navegador (range, from, to, modulo).
+        r = requests.get(
+            f'{_api_url()}/api/historical',
+            params=request.args.to_dict(),
+            headers=_dashboard_proxy_headers(),
+            timeout=10,
+        )
+        data = r.json() if r.status_code == 200 else None
+
         if data:
             return jsonify(data)
         else:
@@ -286,109 +836,400 @@ def api_historical():
                 "ammonia": [],
                 "co": [],
                 "co2": [],
+                "oxygen": [],
                 "error": "No hay datos disponibles"
             })
             
-    except Exception as e:
-        print(f"Error api_historical: {e}")
-        return jsonify({
-            "timestamps": [],
-            "house": [],
-            "temperature": [],
-            "humidity": [],
-            "ammonia": [],
-            "co": [],
-            "co2": [],
-            "error": str(e)
-        }), 500
+    except Exception:
+        return _dashboard_internal_error()
 
-@app.route('/api/umbrales')
-def api_umbrales():
-    """Endpoint proxy para umbrales"""
+@app.route('/api/live-data')
+@login_required
+@limiter.limit(DASHBOARD_POLLING_RATE_LIMIT)
+def api_live_data():
+    """Proxy autenticado para datos en tiempo real."""
     try:
-        data = get_umbrales_from_api()
-        return jsonify(data)
+        r = requests.get(
+            f'{_api_url()}/api/live-data',
+            params=request.args.to_dict(),
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
+
+
+@app.route('/api/umbrales', methods=['GET', 'POST'])
+@login_required
+def api_umbrales():
+    """Proxy autenticado para consultar y actualizar umbrales."""
+    if request.method == 'POST':
+        denied = require_dashboard_roles('admin', 'operador')
+        if denied:
+            return denied
+
+    try:
+        if request.method == 'GET':
+            r = requests.get(
+                f'{_api_url()}/api/umbrales',
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        else:
+            r = requests.post(
+                f'{_api_url()}/api/umbrales',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return _dashboard_internal_error()
+
 
 def _api_url():
-    return os.getenv('API_BASE_URL', 'http://localhost:5000')
+    return os.getenv('API_BASE_URL', 'http://localhost:5000').rstrip('/')
+
+
+def _dashboard_proxy_headers():
+    """Headers internos para que la API identifique al usuario real."""
+    proxy_key = os.getenv("DASHBOARD_PROXY_KEY", "")
+
+    if not proxy_key:
+        app.logger.error("dashboard_proxy_key_missing")
+
+    # ProxyFix ya dejo en remote_addr la IP que Nginx vio; no leer la cabecera cruda.
+    source_ip = request.remote_addr
+
+    return {
+        "X-Dashboard-Proxy-Key": proxy_key,
+        "X-Dashboard-User-Id": str(current_user.id),
+        "X-Dashboard-Source-IP": source_ip or "",
+    }
+
+
+def _proxy_json_response(response):
+    try:
+        return jsonify(response.json()), response.status_code
+    except ValueError:
+        return jsonify({
+            'error': 'Respuesta inválida desde API interna.'
+        }), response.status_code
+
+
+def _dashboard_internal_error(message='Error interno del dashboard.'):
+    """Registrar la excepción activa sin devolver detalles al navegador."""
+    app.logger.exception(
+        "event=dashboard_request_failed endpoint=%s method=%s source_ip=%s",
+        request.endpoint,
+        request.method,
+        request.remote_addr,
+    )
+    return jsonify({'error': message}), 500
+
+
+@app.route('/dashboard-api/user/<int:user_id>', methods=['GET', 'PUT'])
+@app.route('/api/user/<int:user_id>', methods=['GET', 'PUT'])
+@login_required
+def proxy_user(user_id):
+    try:
+        if request.method == 'GET':
+            r = requests.get(
+                f'{_api_url()}/api/user/{user_id}',
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        else:
+            r = requests.put(
+                f'{_api_url()}/api/user/{user_id}',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+
+        return _proxy_json_response(r)
+    except Exception as e:
+        return _dashboard_internal_error()
+
+
+@app.route('/api/alerts', methods=['GET'])
+@login_required
+@limiter.limit(DASHBOARD_ALERT_RATE_LIMIT)
+def proxy_alerts():
+    try:
+        r = requests.get(
+            f'{_api_url()}/api/alerts',
+            params=request.args.to_dict(),
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return _dashboard_internal_error()
+
+
+@app.route('/api/alerts/stats', methods=['GET'])
+@login_required
+@limiter.limit(DASHBOARD_ALERT_RATE_LIMIT)
+def proxy_alert_stats():
+    try:
+        r = requests.get(
+            f'{_api_url()}/api/alerts/stats',
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return _dashboard_internal_error()
+
+
+@app.route('/api/alerts/<int:alert_id>', methods=['PUT'])
+@login_required
+def proxy_alert(alert_id):
+    denied = require_dashboard_roles('admin', 'operador')
+    if denied:
+        return denied
+
+    try:
+        r = requests.put(
+            f'{_api_url()}/api/alerts/{alert_id}',
+            json=request.get_json(silent=True),
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return _dashboard_internal_error()
+
+
+@app.route('/api/alerts/mark-all', methods=['PUT'])
+@login_required
+def proxy_mark_all_alerts():
+    denied = require_dashboard_roles('admin', 'operador')
+    if denied:
+        return denied
+
+    try:
+        r = requests.put(
+            f'{_api_url()}/api/alerts/mark-all',
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return _dashboard_internal_error()
+
+
+@app.route('/api/alerts/all', methods=['DELETE'])
+@login_required
+def proxy_delete_all_alerts():
+    denied = require_dashboard_roles('admin')
+    if denied:
+        return denied
+
+    try:
+        r = requests.delete(
+            f'{_api_url()}/api/alerts/all',
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return _dashboard_internal_error()
+
+
+@app.route('/api/alerts/check', methods=['POST'])
+@login_required
+def proxy_alert_check():
+    denied = require_dashboard_roles('admin', 'operador')
+    if denied:
+        return denied
+
+    try:
+        r = requests.post(
+            f'{_api_url()}/api/alerts/check',
+            headers=_dashboard_proxy_headers(),
+            timeout=10,
+        )
+        return _proxy_json_response(r)
+    except Exception as e:
+        return _dashboard_internal_error()
+
+
+@app.route('/api/security-events', methods=['GET'])
+@dashboard_roles_required('admin', 'operador')
+def proxy_security_events():
+    try:
+        r = requests.get(
+            f'{_api_url()}/api/security-events',
+            params=request.args.to_dict(),
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
+    except requests.RequestException:
+        app.logger.exception('dashboard_security_events_proxy_failed')
+        return jsonify({
+            'error': 'No fue posible consultar los eventos de seguridad.'
+        }), 502
+
 
 @app.route('/api/granjas', methods=['GET', 'POST'])
 @login_required
 def proxy_granjas():
+    if request.method == 'POST':
+        denied = require_dashboard_roles('admin')
+        if denied:
+            return denied
+
     try:
         if request.method == 'GET':
-            r = requests.get(f'{_api_url()}/api/granjas', timeout=5)
+            r = requests.get(
+                f'{_api_url()}/api/granjas',
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
         else:
-            r = requests.post(f'{_api_url()}/api/granjas', json=request.get_json(), timeout=5)
-        return jsonify(r.json()), r.status_code
+            r = requests.post(
+                f'{_api_url()}/api/granjas',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
+
 
 @app.route('/api/granjas/<int:granja_id>', methods=['PUT', 'DELETE'])
 @login_required
 def proxy_granja(granja_id):
+    denied = require_dashboard_roles('admin')
+    if denied:
+        return denied
+
     try:
         if request.method == 'PUT':
-            r = requests.put(f'{_api_url()}/api/granjas/{granja_id}', json=request.get_json(), timeout=5)
+            r = requests.put(
+                f'{_api_url()}/api/granjas/{granja_id}',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
         else:
-            r = requests.delete(f'{_api_url()}/api/granjas/{granja_id}', timeout=5)
-        return jsonify(r.json()), r.status_code
+            r = requests.delete(
+                f'{_api_url()}/api/granjas/{granja_id}',
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
+
 
 @app.route('/api/naves', methods=['GET', 'POST'])
 @login_required
 def proxy_naves():
+    if request.method == 'POST':
+        denied = require_dashboard_roles('admin')
+        if denied:
+            return denied
+
     try:
         if request.method == 'GET':
-            params = request.args.to_dict()
-            r = requests.get(f'{_api_url()}/api/naves', params=params, timeout=5)
+            r = requests.get(
+                f'{_api_url()}/api/naves',
+                params=request.args.to_dict(),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
         else:
-            r = requests.post(f'{_api_url()}/api/naves', json=request.get_json(), timeout=5)
-        return jsonify(r.json()), r.status_code
+            r = requests.post(
+                f'{_api_url()}/api/naves',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
+
 
 @app.route('/api/naves/<int:nave_id>', methods=['PUT', 'DELETE'])
 @login_required
 def proxy_nave(nave_id):
+    denied = require_dashboard_roles('admin')
+    if denied:
+        return denied
+
     try:
         if request.method == 'PUT':
-            r = requests.put(f'{_api_url()}/api/naves/{nave_id}', json=request.get_json(), timeout=5)
+            r = requests.put(
+                f'{_api_url()}/api/naves/{nave_id}',
+                json=request.get_json(silent=True),
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
         else:
-            r = requests.delete(f'{_api_url()}/api/naves/{nave_id}', timeout=5)
-        return jsonify(r.json()), r.status_code
+            r = requests.delete(
+                f'{_api_url()}/api/naves/{nave_id}',
+                headers=_dashboard_proxy_headers(),
+                timeout=5,
+            )
+        return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
+
 
 @app.route('/api/modulos', methods=['GET'])
 @login_required
 def proxy_modulos():
     try:
-        r = requests.get(f'{_api_url()}/api/modulos', timeout=5)
-        return jsonify(r.json()), r.status_code
+        r = requests.get(
+            f'{_api_url()}/api/modulos',
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
+
 
 @app.route('/api/modulos/<string:codigo>', methods=['PUT'])
 @login_required
 def proxy_modulo(codigo):
+    denied = require_dashboard_roles('admin', 'operador')
+    if denied:
+        return denied
+
     try:
-        r = requests.put(f'{_api_url()}/api/modulos/{codigo}', json=request.get_json(), timeout=5)
-        return jsonify(r.json()), r.status_code
+        r = requests.put(
+            f'{_api_url()}/api/modulos/{codigo}',
+            json=request.get_json(silent=True),
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
+
 
 @app.route('/api/parvada/<string:modulo>')
 @login_required
+@limiter.limit(DASHBOARD_PARVADA_RATE_LIMIT)
 def proxy_parvada(modulo):
     try:
-        r = requests.get(f'{_api_url()}/api/parvada/{modulo}', timeout=5)
-        return jsonify(r.json()), r.status_code
+        r = requests.get(
+            f'{_api_url()}/api/parvada/{modulo}',
+            headers=_dashboard_proxy_headers(),
+            timeout=5,
+        )
+        return _proxy_json_response(r)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return _dashboard_internal_error()
+
 
 #Redirigir la raíz '/' al login
 @app.route('/')
@@ -398,89 +1239,74 @@ def index():
 @app.route('/historical')
 @login_required
 def historical():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.role,
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('historical.html', active='historical', user_data=user_data)
+    return render_template(
+        'historical.html',
+        active='historical',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 @app.route('/analysis')
 @login_required
 def analysis():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.role,
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('analysis.html', active='analysis', user_data=user_data)
+    return render_template(
+        'analysis.html',
+        active='analysis',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 @app.route('/alerts')
 @login_required
 def alerts():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.role,
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('alerts.html', active='alerts', user_data=user_data)
+    return render_template(
+        'alerts.html',
+        active='alerts',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 @app.route('/devices')
 @login_required
 def devices():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.role,
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('devices.html', active='devices', user_data=user_data)
+    return render_template(
+        'devices.html',
+        active='devices',
+        user_data=serialize_dashboard_user(current_user),
+    )
+
+
+@app.route('/security-events')
+@dashboard_roles_required('admin', 'operador')
+def security_events():
+    return render_template(
+        'security_events.html',
+        active='security_events',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 @app.route('/ml_models')
 @login_required
 def ml_models():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.role,
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('ml_models.html', active='ml_models', user_data=user_data)
+    return render_template(
+        'ml_models.html',
+        active='ml_models',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 @app.route('/reports')
 @login_required
 def reports():
-    user_data = {
-        'id': current_user.id,
-        'username': current_user.username,
-        'full_name': current_user.full_name,
-        'role': current_user.role,
-        'initials': current_user.initials,
-        'profile_image_url': current_user.profile_image_url
-    }
-    return render_template('reports.html', active='reports', user_data=user_data)
+    return render_template(
+        'reports.html',
+        active='reports',
+        user_data=serialize_dashboard_user(current_user),
+    )
 
 # En dashboard_avicola.py, modifica la función start:
 def start(port=5001, host='0.0.0.0'):
     if not os.path.exists('templates'):
         os.makedirs('templates')
-    app.run(debug=True, port=port, host=host, use_reloader=False)
+    debug_mode = os.getenv("FLASK_ENV", "development").lower() == "development"
+    app.run(debug=debug_mode, port=port, host=host, use_reloader=False)
 
 
 if __name__ == '__main__':
     start()
-
-

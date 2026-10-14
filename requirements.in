@@ -1,0 +1,18 @@
+# Direct Python runtime dependencies shared by the API, dashboard, and MQTT
+# subscriber images. Regenerate requirements.txt; do not install this file in
+# production containers.
+Flask
+Flask-Login
+Flask-Cors
+Flask-SQLAlchemy
+gunicorn
+psycopg2-binary
+python-dotenv
+Werkzeug
+requests
+paho-mqtt==2.1.0
+Flask-Limiter
+PyJWT
+cryptography
+pyotp
+qrcode[pil]

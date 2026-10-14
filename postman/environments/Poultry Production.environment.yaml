@@ -1,0 +1,11 @@
+name: Poultry Production
+values:
+  - key: base_url
+    value: ''
+  - key: allowed_origin
+    value: ''
+  - key: bad_origin
+    value: ''
+  - key: reading_id
+    value: ''
+color: 240

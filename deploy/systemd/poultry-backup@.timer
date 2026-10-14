@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Poultry IoT PostgreSQL backup daily
+
+[Timer]
+OnCalendar=*-*-* 02:15:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=poultry-backup@%i.service
+
+[Install]
+WantedBy=timers.target
