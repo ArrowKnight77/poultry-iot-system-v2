@@ -7,12 +7,13 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 from functools import wraps
 import hashlib
+import math
 import os
 import re
 import jwt
 import hmac
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import requests
 import logging
 import sys
@@ -106,6 +107,11 @@ def internal_error_response(message="Error interno del servidor."):
 
 
 app = Flask(__name__)
+
+# Nginx es el unico proxy de confianza delante de la API. Con x_for=1 se toma
+# solo el ultimo valor de X-Forwarded-For, que es el que escribe Nginx.
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 environment = os.getenv("FLASK_ENV", "production").lower()
 
@@ -225,8 +231,17 @@ HISTORICAL_DATA_RATE_LIMIT = "30 per minute"
 ALERT_QUERY_RATE_LIMIT = "60 per minute"
 PARVADA_QUERY_RATE_LIMIT = "60 per minute"
 
+def rate_limit_client_key():
+    """Contar por cliente real: IP delegada por el dashboard o vista via Nginx."""
+    if validate_dashboard_proxy_key():
+        delegated_ip = request.headers.get("X-Dashboard-Source-IP", "").strip()
+        if delegated_ip:
+            return delegated_ip[:64]
+    return get_remote_address()
+
+
 limiter = Limiter(
-    get_remote_address,
+    rate_limit_client_key,
     app=app,
     default_limits=["10000 per day", "2000 per hour"],
     storage_uri="memory://"
@@ -268,6 +283,7 @@ def health_check():
         return jsonify({'status': 'unavailable'}), 503
 
 PASSWORD_HASH_METHOD = "scrypt"
+MIN_PASSWORD_LENGTH = 12
 PASSWORD_HASH_SALT_LENGTH = 16
 CURRENT_PASSWORD_HASH_PREFIX = "scrypt:"
 SUPPORTED_PASSWORD_HASH_PREFIXES = ("scrypt:", "pbkdf2:")
@@ -378,6 +394,7 @@ class User(db.Model):
     mfa_secret_encrypted = db.Column(db.String(512))
     mfa_enrolled_at = db.Column(db.DateTime)
     mfa_last_verified_at = db.Column(db.DateTime)
+    session_epoch = db.Column(db.Integer, nullable=False, default=0, server_default="0")
     
     def set_password(self, password):
         """Hash the password and store it."""
@@ -1303,6 +1320,13 @@ SENSOR_LIMITS = {
     "oxigeno": (0.0, 25.0),
 }
 
+TELEMETRY_MAX_FUTURE_SKEW = timedelta(minutes=5)
+TELEMETRY_MAX_AGE = timedelta(
+    hours=read_positive_security_int(
+        "TELEMETRY_MAX_AGE_HOURS", 24, minimum=1, maximum=720,
+    )
+)
+
 REQUIRED_LECTURA_FIELDS = [
     "id_lectura",
     "modulo",
@@ -1323,10 +1347,16 @@ def _parse_sensor_float(value, field_name, errors):
         return None
 
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         errors.append(f"'{field_name}' debe ser un valor numérico.")
         return None
+
+    if not math.isfinite(number):
+        errors.append(f"'{field_name}' debe ser un número finito.")
+        return None
+
+    return number
 
 
 def _parse_iso_datetime(value, errors):
@@ -1366,6 +1396,17 @@ def validate_lectura_payload(data):
         errors.append("'modulo' solo puede contener letras, números, guion y guion bajo; máximo 50 caracteres.")
 
     hora = _parse_iso_datetime(data.get("hora"), errors)
+
+    if hora is not None:
+        # Normalizar a UTC sin zona y exigir una ventana de frescura.
+        if hora.tzinfo is not None:
+            hora = hora.astimezone(timezone.utc).replace(tzinfo=None)
+
+        now = datetime.utcnow()
+        if hora > now + TELEMETRY_MAX_FUTURE_SKEW:
+            errors.append("'hora' está en el futuro respecto al servidor.")
+        elif hora < now - TELEMETRY_MAX_AGE:
+            errors.append("'hora' es más antigua que la ventana permitida.")
 
     normalized = {
         "id_lectura": id_lectura.strip() if isinstance(id_lectura, str) else id_lectura,
@@ -1531,6 +1572,7 @@ def insert_lectura():
 # ENDPINT to get the last record  
 @app.route('/lecturas', methods=['GET'])
 @limiter.limit(LIVE_DATA_RATE_LIMIT)
+@auth_required()
 def get_lecturas():
     """Endpoint para obtener lecturas (formato array)"""
     try:
@@ -1565,6 +1607,7 @@ def get_lecturas():
 # Live data endpoint for dashboard
 @app.route('/api/live-data', methods=['GET'])
 @limiter.limit(LIVE_DATA_RATE_LIMIT)
+@auth_required()
 def get_live_data():
     """Endpoint para obtener datos en tiempo real (formato objeto)"""
     try:
@@ -1601,6 +1644,7 @@ def get_live_data():
 
 @app.route('/api/historical')
 @limiter.limit(HISTORICAL_DATA_RATE_LIMIT)
+@auth_required()
 def historical_data():
     try:
         from datetime import datetime, timedelta
@@ -1655,13 +1699,23 @@ def historical_data():
         if house_param and house_param != 'all':
             query = query.filter(Lectura.modulo == house_param)
             
-        lecturas = query.order_by(Lectura.hora).all()
-
-        # Downsample para visualización: máximo 1500 puntos por gráfica
+        # Downsample en SQL: nunca se cargan a memoria mas de ~MAX_POINTS filas.
         MAX_POINTS = 1500
-        if len(lecturas) > MAX_POINTS:
-            step = len(lecturas) // MAX_POINTS
-            lecturas = lecturas[::step]
+        total = query.count()
+        if total > MAX_POINTS:
+            step = math.ceil(total / MAX_POINTS)
+            numbered = query.with_entities(
+                Lectura.id_lectura.label("id_lectura"),
+                db.func.row_number().over(order_by=Lectura.hora).label("rn"),
+            ).subquery()
+            sampled_ids = db.session.query(numbered.c.id_lectura).filter(
+                numbered.c.rn % step == 0
+            )
+            lecturas = Lectura.query.filter(
+                Lectura.id_lectura.in_(sampled_ids)
+            ).order_by(Lectura.hora).all()
+        else:
+            lecturas = query.order_by(Lectura.hora).all()
 
         logger.debug(
         "event=historical_query_completed range=%s module=%s record_count=%s",
@@ -1724,6 +1778,11 @@ def register_user():
         if not username or not isinstance(password, str) or not password:
             return jsonify({
                 'error': 'username y password son requeridos.'
+            }), 400
+
+        if len(password) < MIN_PASSWORD_LENGTH or password.casefold() == username.casefold():
+            return jsonify({
+                'error': f'La contraseña debe tener al menos {MIN_PASSWORD_LENGTH} caracteres y ser distinta del usuario.'
             }), 400
 
         if User.query.filter_by(username=username).first():
@@ -2179,6 +2238,14 @@ def verify_auth_token():
 @auth_required()
 def user_detail(user_id):
     try:
+        actor = request.current_user
+        actor_role = normalize_role(actor.role)
+        is_self_update = actor.id == user_id
+
+        # Un usuario solo ve su propio perfil; el admin ve cualquiera.
+        if not is_self_update and actor_role != 'admin':
+            return jsonify({'error': 'Permisos insuficientes.'}), 403
+
         user = User.query.get(user_id)
 
         if not user:
@@ -2186,10 +2253,6 @@ def user_detail(user_id):
 
         if request.method == 'GET':
             return jsonify(serialize_user(user))
-
-        actor = request.current_user
-        actor_role = normalize_role(actor.role)
-        is_self_update = actor.id == user.id
 
         if not is_self_update and actor_role != 'admin':
             return jsonify({
@@ -2309,6 +2372,7 @@ def user_detail(user_id):
 
 # Thresholds Endpoints
 @app.route('/api/umbrales', methods=['GET'])
+@auth_required()
 def get_umbrales():
     try:
         umbrales = Umbral.query.all()
@@ -2520,6 +2584,7 @@ def get_historical_data(range, from_date=None, to_date=None):
 # Alerts API endpoints
 @app.route('/api/alerts', methods=['GET'])
 @limiter.limit(ALERT_QUERY_RATE_LIMIT)
+@auth_required()
 def get_alerts():
     """Get all alerts with filtering options"""
     try:
@@ -2527,7 +2592,8 @@ def get_alerts():
         status = request.args.get('status', 'all')
         modulo = request.args.get('modulo', 'all')
         limit = request.args.get('limit', 100, type=int)
-        
+        limit = max(1, min(limit or 100, 500))
+
         query = Alerta.query
         
         if priority != 'all':
@@ -2629,6 +2695,7 @@ def update_alert(alert_id):
 
 @app.route('/api/alerts/stats', methods=['GET'])
 @limiter.limit(ALERT_QUERY_RATE_LIMIT)
+@auth_required()
 def get_alert_stats():
     """Get alert statistics"""
     try:
@@ -2841,6 +2908,7 @@ def ingest_security_event():
 # -------------------------------------------------------
 
 @app.route('/api/granjas', methods=['GET'])
+@auth_required()
 def get_granjas():
     try:
         granjas = Granja.query.all()
@@ -2964,6 +3032,7 @@ def delete_granja(granja_id):
 # -------------------------------------------------------
 
 @app.route('/api/naves', methods=['GET'])
+@auth_required()
 def get_naves():
     try:
         granja_id = request.args.get('granja_id', type=int)
@@ -3123,6 +3192,7 @@ def delete_nave(nave_id):
 # -------------------------------------------------------
 
 @app.route('/api/modulos', methods=['GET'])
+@auth_required()
 def get_modulos():
     try:
         # Módulos registrados en la tabla
@@ -3211,6 +3281,7 @@ def update_modulo(codigo):
 
 @app.route('/api/parvada/<string:modulo_codigo>', methods=['GET'])
 @limiter.limit(PARVADA_QUERY_RATE_LIMIT)
+@auth_required()
 def get_parvada(modulo_codigo):
     try:
         m = Modulo.query.filter_by(codigo=modulo_codigo).first()

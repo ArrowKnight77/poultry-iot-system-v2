@@ -48,6 +48,11 @@ dashboard_session_expires_minutes = read_bounded_int(
 )
 
 app = Flask(__name__)
+
+# Nginx es el unico proxy de confianza delante del dashboard.
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
 dashboard_secret_key = os.getenv('SECRET_KEY')
 if not dashboard_secret_key or len(dashboard_secret_key) < 32:
     raise RuntimeError(
@@ -237,6 +242,11 @@ class User(UserMixin, db.Model):
     mfa_secret_encrypted = db.Column(db.String(512))
     mfa_enrolled_at = db.Column(db.DateTime)
     mfa_last_verified_at = db.Column(db.DateTime)
+    session_epoch = db.Column(db.Integer, nullable=False, default=0, server_default="0")
+
+    def get_id(self):
+        # La cookie queda ligada a la "epoca" de sesion vigente del usuario.
+        return f"{self.id}:{self.session_epoch or 0}"
     
     def set_password(self, password):
         """Hash the password and store it."""
@@ -334,7 +344,18 @@ except Exception as e:
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    raw_id, _, raw_epoch = str(user_id).partition(":")
+
+    try:
+        user = db.session.get(User, int(raw_id))
+    except (TypeError, ValueError):
+        return None
+
+    # Una cookie emitida antes del ultimo logout ya no carga al usuario.
+    if user is None or str(user.session_epoch or 0) != raw_epoch:
+        return None
+
+    return user
 
 
 @login_manager.unauthorized_handler
@@ -405,7 +426,7 @@ def get_live_data():
         timestamp = int(time.time())
         url = f'{api_url}/api/live-data?t={timestamp}'
         
-        response = requests.get(url, timeout=5)
+        response = requests.get(url, headers=_dashboard_proxy_headers(), timeout=5)
         print(f"🔍 Estado API Dashboard: {response.status_code} - URL: {url}")
         
         if response.status_code == 200:
@@ -438,7 +459,7 @@ def get_historical_data_from_api(range_param, from_date=None, to_date=None, hous
         if house_param:
             url += f'&house={house_param}'
         
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, headers=_dashboard_proxy_headers(), timeout=10)
         if response.status_code == 200:
             return response.json()
         else:
@@ -453,7 +474,7 @@ def get_umbrales_from_api():
     try:
         api_url = os.getenv('API_BASE_URL', 'http://localhost:5000')
         url = f'{api_url}/api/umbrales'
-        response = requests.get(url, timeout=5)
+        response = requests.get(url, headers=_dashboard_proxy_headers(), timeout=5)
         if response.status_code == 200:
             return response.json()
         return []
@@ -709,8 +730,8 @@ def register():
                 flash('Las contraseñas no coinciden')
                 return render_template('login.html', show_register=True)
             
-            if len(password) < 6:
-                flash('La contraseña debe tener al menos 6 caracteres')
+            if len(password) < 12:
+                flash('La contraseña debe tener al menos 12 caracteres')
                 return render_template('login.html', show_register=True)
             
             # Crear usuario
@@ -760,6 +781,9 @@ def register():
 @app.route('/logout', methods=['POST'])
 @login_required
 def logout():
+    # Invalidar en servidor todas las cookies emitidas para este usuario.
+    current_user.session_epoch = (current_user.session_epoch or 0) + 1
+    db.session.commit()
     logout_user()
     session.clear()
     return redirect('/login')
@@ -792,13 +816,15 @@ def dashboard():
 def api_historical():
     """Endpoint proxy para datos históricos - funciona desde cualquier dispositivo"""
     try:
-        range_param = request.args.get('range', '24h')
-        from_date = request.args.get('from', None)
-        to_date = request.args.get('to', None)
-        house_param = request.args.get('house', None)
-        
-        data = get_historical_data_from_api(range_param, from_date, to_date, house_param)
-        
+        # Reenviar los mismos parametros que manda el navegador (range, from, to, modulo).
+        r = requests.get(
+            f'{_api_url()}/api/historical',
+            params=request.args.to_dict(),
+            headers=_dashboard_proxy_headers(),
+            timeout=10,
+        )
+        data = r.json() if r.status_code == 200 else None
+
         if data:
             return jsonify(data)
         else:
@@ -874,12 +900,8 @@ def _dashboard_proxy_headers():
     if not proxy_key:
         app.logger.error("dashboard_proxy_key_missing")
 
-    forwarded_for = request.headers.get("X-Forwarded-For", "")
-    source_ip = (
-        forwarded_for.split(",", 1)[0].strip()
-        if forwarded_for
-        else request.remote_addr
-    )
+    # ProxyFix ya dejo en remote_addr la IP que Nginx vio; no leer la cabecera cruda.
+    source_ip = request.remote_addr
 
     return {
         "X-Dashboard-Proxy-Key": proxy_key,
