@@ -2434,10 +2434,14 @@ def update_umbrales():
             umbral = Umbral.query.filter_by(variable=variable).first()
 
             if umbral:
+                prev_medio = umbral.valor_medio
+                prev_alto = umbral.valor_alto
+                prev_grave = umbral.valor_grave
                 umbral.valor_medio = valor_medio
                 umbral.valor_alto = valor_alto
                 umbral.valor_grave = valor_grave
             else:
+                prev_medio = prev_alto = prev_grave = None
                 umbral = Umbral(
                     variable=variable,
                     valor_medio=valor_medio,
@@ -2446,17 +2450,27 @@ def update_umbrales():
                 )
                 db.session.add(umbral)
 
-            updated_variables.append(variable)
+            updated_variables.append({
+                'variable': variable,
+                'prev': f"{prev_medio}/{prev_alto}/{prev_grave}" if prev_medio is not None else "none",
+                'new': f"{valor_medio}/{valor_alto}/{valor_grave}",
+            })
 
         db.session.commit()
 
+        diff_summary = ";".join([
+            f"{item['variable']}:{item['prev']}->{item['new']}"
+            for item in updated_variables
+        ])
+
         logger.info(
             "event=thresholds_updated actor_user_id=%s actor_role=%s "
-            "updated_count=%s source_ip=%s",
+            "updated_count=%s source_ip=%s changes=%s",
             request.current_user.id,
             safe_log_value(normalize_role(request.current_user.role), limit=32),
             len(updated_variables),
             request_audit_source_ip(),
+            safe_log_value(diff_summary, limit=160),
         )
 
         record_privileged_action(
@@ -2470,9 +2484,10 @@ def update_umbrales():
             ],
             affected_count=len(updated_variables),
             variables=','.join(sorted({
-                safe_log_value(variable, limit=50)
-                for variable in updated_variables
+                safe_log_value(item['variable'], limit=50)
+                for item in updated_variables
             })),
+            threshold_changes=safe_log_value(diff_summary, limit=160),
         )
 
         return jsonify({
