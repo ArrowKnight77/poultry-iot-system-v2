@@ -1,3 +1,4 @@
+from werkzeug.exceptions import HTTPException
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import select, text
@@ -107,6 +108,12 @@ def internal_error_response(message="Error interno del servidor."):
 
 
 app = Flask(__name__)
+ALLOWED_UMBRAL_VARIABLES = {
+    'temperatura', 'humedad', 'co2', 'amoniaco', 'luz',
+    'presion', 'nivel_agua', 'consumo_alimento'
+}
+ALLOWED_ALERT_STATES = {'active', 'acknowledged', 'resolved'}
+
 
 # Nginx es el unico proxy de confianza delante de la API. Con x_for=1 se toma
 # solo el ultimo valor de X-Forwarded-For, que es el que escribe Nginx.
@@ -230,6 +237,11 @@ LIVE_DATA_RATE_LIMIT = "120 per minute"
 HISTORICAL_DATA_RATE_LIMIT = "30 per minute"
 ALERT_QUERY_RATE_LIMIT = "60 per minute"
 PARVADA_QUERY_RATE_LIMIT = "60 per minute"
+SECURITY_EVENTS_INGEST_RATE_LIMIT = os.getenv(
+    "SECURITY_EVENTS_INGEST_RATE_LIMIT",
+    "30 per minute",
+)
+SECURITY_EVENTS_RETENTION_DAYS = int(os.getenv("SECURITY_EVENTS_RETENTION_DAYS", "90"))
 
 def rate_limit_client_key():
     """Contar por cliente real: IP delegada por el dashboard o vista via Nginx."""
@@ -2422,6 +2434,11 @@ def update_umbrales():
                     'error': 'La variable del umbral es requerida.'
                 }), 400
 
+            if variable not in ALLOWED_UMBRAL_VARIABLES:
+                return jsonify({
+                    'error': f"Variable de umbral no permitida. Valores permitidos: {', '.join(sorted(ALLOWED_UMBRAL_VARIABLES))}"
+                }), 400
+
             if not (valor_medio < valor_alto < valor_grave):
                 return jsonify({
                     'error': (
@@ -2434,10 +2451,14 @@ def update_umbrales():
             umbral = Umbral.query.filter_by(variable=variable).first()
 
             if umbral:
+                prev_medio = umbral.valor_medio
+                prev_alto = umbral.valor_alto
+                prev_grave = umbral.valor_grave
                 umbral.valor_medio = valor_medio
                 umbral.valor_alto = valor_alto
                 umbral.valor_grave = valor_grave
             else:
+                prev_medio = prev_alto = prev_grave = None
                 umbral = Umbral(
                     variable=variable,
                     valor_medio=valor_medio,
@@ -2446,17 +2467,27 @@ def update_umbrales():
                 )
                 db.session.add(umbral)
 
-            updated_variables.append(variable)
+            updated_variables.append({
+                'variable': variable,
+                'prev': f"{prev_medio}/{prev_alto}/{prev_grave}" if prev_medio is not None else "none",
+                'new': f"{valor_medio}/{valor_alto}/{valor_grave}",
+            })
 
         db.session.commit()
 
+        diff_summary = ";".join([
+            f"{item['variable']}:{item['prev']}->{item['new']}"
+            for item in updated_variables
+        ])
+
         logger.info(
             "event=thresholds_updated actor_user_id=%s actor_role=%s "
-            "updated_count=%s source_ip=%s",
+            "updated_count=%s source_ip=%s changes=%s",
             request.current_user.id,
             safe_log_value(normalize_role(request.current_user.role), limit=32),
             len(updated_variables),
             request_audit_source_ip(),
+            safe_log_value(diff_summary, limit=160),
         )
 
         record_privileged_action(
@@ -2470,9 +2501,10 @@ def update_umbrales():
             ],
             affected_count=len(updated_variables),
             variables=','.join(sorted({
-                safe_log_value(variable, limit=50)
-                for variable in updated_variables
+                safe_log_value(item['variable'], limit=50)
+                for item in updated_variables
             })),
+            threshold_changes=safe_log_value(diff_summary, limit=160),
         )
 
         return jsonify({
@@ -2662,7 +2694,12 @@ def update_alert(alert_id):
         changed_fields = []
 
         if 'estado' in data:
-            alert.estado = data['estado']
+            nuevo_estado = str(data['estado']).strip()
+            if nuevo_estado not in ALLOWED_ALERT_STATES:
+                return jsonify({
+                    'error': f"Estado inválido. Valores permitidos: {', '.join(sorted(ALLOWED_ALERT_STATES))}"
+                }), 400
+            alert.estado = nuevo_estado
             changed_fields.append('estado')
 
             if data['estado'] == 'resolved':
@@ -2844,6 +2881,7 @@ def get_security_events():
 
 
 @app.route("/api/security-events/ingest", methods=["POST"])
+@limiter.limit(SECURITY_EVENTS_INGEST_RATE_LIMIT)
 def ingest_security_event():
     """Recibir eventos técnicos desde mqtt_subscriber con llave propia."""
 
@@ -2957,6 +2995,8 @@ def create_granja():
             'nombre': granja.nombre
         }), 201
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -2994,6 +3034,8 @@ def update_granja(granja_id):
 
         return jsonify({'msg': 'Granja actualizada'})
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3022,6 +3064,8 @@ def delete_granja(granja_id):
 
         return jsonify({'msg': 'Granja eliminada'})
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3103,6 +3147,8 @@ def create_nave():
             'nombre': nave.nombre
         }), 201
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3151,6 +3197,8 @@ def update_nave(nave_id):
 
         return jsonify({'msg': 'Nave actualizada'})
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3182,6 +3230,8 @@ def delete_nave(nave_id):
 
         return jsonify({'msg': 'Nave eliminada'})
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3270,6 +3320,8 @@ def update_modulo(codigo):
             'codigo': codigo
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3303,7 +3355,38 @@ def get_parvada(modulo_codigo):
         return internal_error_response()
 
 
-def start(port=5000, host='0.0.0.0'):
+def purge_old_security_events(retention_days=SECURITY_EVENTS_RETENTION_DAYS):
+    """Eliminar eventos de seguridad con antiguedad mayor al periodo de retencion."""
+    if retention_days < 1:
+        raise ValueError("retention_days debe ser mayor a 0")
+
+    cutoff_date = datetime.utcnow() - timedelta(days=retention_days)
+    deleted_count = SecurityEvent.query.filter(
+        SecurityEvent.created_at < cutoff_date
+    ).delete(synchronize_session=False)
+
+    db.session.commit()
+
+    logger.info(
+        "event=security_events_purged retention_days=%s deleted_count=%s cutoff=%s",
+        retention_days,
+        deleted_count,
+        cutoff_date.isoformat(),
+    )
+    return deleted_count
+
+
+@app.cli.command("purge-security-events")
+def purge_security_events_command():
+    """Comando CLI para depurar registros antiguos de auditoria y eventos de seguridad."""
+    try:
+        deleted = purge_old_security_events(retention_days=SECURITY_EVENTS_RETENTION_DAYS)
+        print(f"Depuracion completada: {deleted} eventos anteriores a {SECURITY_EVENTS_RETENTION_DAYS} dias eliminados.")
+    except Exception as e:
+        print(f"Error durante la depuracion de eventos: {e}")
+
+
+def start(port=5000, host='127.0.0.1'):
     debug_mode = os.getenv("FLASK_ENV", "production").lower() == "development"
     app.run(debug=debug_mode, port=port, host=host, use_reloader=False)
 

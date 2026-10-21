@@ -19,6 +19,8 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
+    mem_limit: 384m
+    mem_reservation: 128m
     restart: unless-stopped
 
   mqtt:
@@ -26,7 +28,6 @@ services:
     networks:
       - avicola-network
     ports:
-      - "127.0.0.1:1883:1883"
       - "127.0.0.1:8883:8883"
     volumes:
       - ./mosquitto/config:/mosquitto/config:ro
@@ -38,6 +39,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    mem_limit: 64m
+    mem_reservation: 16m
     restart: unless-stopped
 
   api:
@@ -84,6 +87,8 @@ services:
     pids_limit: 128
     cap_drop:
       - ALL
+    mem_limit: 256m
+    mem_reservation: 64m
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
@@ -114,6 +119,8 @@ services:
     pids_limit: 128
     cap_drop:
       - ALL
+    mem_limit: 192m
+    mem_reservation: 48m
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
@@ -154,6 +161,8 @@ services:
     pids_limit: 128
     cap_drop:
       - ALL
+    mem_limit: 128m
+    mem_reservation: 32m
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped

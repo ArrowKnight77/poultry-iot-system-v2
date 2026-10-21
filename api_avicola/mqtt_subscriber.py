@@ -4,6 +4,8 @@ import math
 import re
 import paho.mqtt.client as mqtt
 import requests, json, uuid, time, os
+import threading
+from queue import Queue, Full
 import logging
 import sys
 
@@ -21,11 +23,17 @@ MQTT_USERNAME = os.getenv('MQTT_USERNAME')
 MQTT_PASSWORD = os.getenv('MQTT_PASSWORD')
 MQTT_TLS_ENABLED = os.getenv("MQTT_TLS_ENABLED", "false").lower() == "true"
 MQTT_TLS_CA_CERT = os.getenv("MQTT_TLS_CA_CERT")
-MQTT_HEALTH_FILE = os.getenv("MQTT_HEALTH_FILE", "/tmp/mqtt-connected")
+MQTT_HEALTH_FILE = os.getenv("MQTT_HEALTH_FILE", "/tmp/mqtt-connected")  # nosec B108
 # Por defecto escuchamos todos los módulos y tanto esquema viejo como nuevo
 # - Esquema viejo: sensor/modulo1/temperatura, sensor/modulo1/humedad, etc.
 # - Esquema nuevo: sensor/modulo1/data (JSON con todos los valores)
 MQTT_TOPIC = os.getenv('MQTT_TOPIC', 'sensor/#')
+TELEMETRY_QUEUE_MAXSIZE = int(os.getenv('TELEMETRY_QUEUE_MAXSIZE', '1000'))
+TELEMETRY_MAX_RETRIES = int(os.getenv('TELEMETRY_MAX_RETRIES', '3'))
+TELEMETRY_BACKOFF_FACTOR = float(os.getenv('TELEMETRY_BACKOFF_FACTOR', '1.5'))
+
+telemetry_queue = Queue(maxsize=TELEMETRY_QUEUE_MAXSIZE)
+_worker_stop_event = threading.Event()
 
 
 class UTCLogFormatter(logging.Formatter):
@@ -280,6 +288,130 @@ def report_security_event(
 current_readings = {}
 last_reading_time = None
 node_states = {}
+
+
+def enqueue_telemetry(payload, source="unknown"):
+    """Encolar lectura para envio asincrono sin bloquear el bucle MQTT."""
+    try:
+        telemetry_queue.put_nowait({"payload": payload, "source": source})
+        return True
+    except Full:
+        logger.error(
+            "event=telemetry_queue_full source=%s module=%s reading_id=%s action=dropped",
+            source,
+            safe_log_value(payload.get("modulo"), limit=32),
+            safe_log_value(payload.get("id_lectura")),
+        )
+        report_security_event(
+            event_type="telemetry_dropped",
+            reason="queue_overflow",
+            module_id=payload.get("modulo"),
+            severity="warning",
+        )
+        return False
+
+
+def _send_telemetry_with_retry(item):
+    """Enviar lectura con mecanismo de reintento y retroceso exponencial."""
+    payload = item["payload"]
+    source = item["source"]
+    headers = build_api_headers()
+
+    for attempt in range(1, TELEMETRY_MAX_RETRIES + 1):
+        if _worker_stop_event.is_set():
+            break
+        try:
+            response = requests.post(
+                API_URL,
+                json=payload,
+                headers=headers,
+                timeout=5,
+            )
+
+            if response.status_code in (200, 201):
+                logger.info(
+                    "event=telemetry_forwarded source=%s module=%s reading_id=%s http_status=%s attempt=%s",
+                    source,
+                    safe_log_value(payload["modulo"], limit=32),
+                    safe_log_value(payload["id_lectura"]),
+                    response.status_code,
+                    attempt,
+                )
+                return True
+
+            # Si es un error 4xx de cliente (excepto 429), no reintentar
+            if 400 <= response.status_code < 500 and response.status_code != 429:
+                logger.error(
+                    "event=telemetry_forward_failed source=%s reason=client_error module=%s reading_id=%s http_status=%s",
+                    source,
+                    safe_log_value(payload["modulo"], limit=32),
+                    safe_log_value(payload["id_lectura"]),
+                    response.status_code,
+                )
+                return False
+
+            logger.warning(
+                "event=telemetry_forward_retry source=%s reason=api_http_error module=%s reading_id=%s http_status=%s attempt=%s",
+                source,
+                safe_log_value(payload["modulo"], limit=32),
+                safe_log_value(payload["id_lectura"]),
+                response.status_code,
+                attempt,
+            )
+
+        except requests.exceptions.ConnectionError:
+            logger.warning(
+                "event=telemetry_forward_retry source=%s reason=api_connection module=%s reading_id=%s attempt=%s",
+                source,
+                safe_log_value(payload["modulo"], limit=32),
+                safe_log_value(payload["id_lectura"]),
+                attempt,
+            )
+        except requests.exceptions.Timeout:
+            logger.warning(
+                "event=telemetry_forward_retry source=%s reason=api_timeout module=%s reading_id=%s attempt=%s",
+                source,
+                safe_log_value(payload["modulo"], limit=32),
+                safe_log_value(payload["id_lectura"]),
+                attempt,
+            )
+        except Exception:
+            logger.exception(
+                "event=telemetry_forward_retry source=%s reason=unexpected_error module=%s reading_id=%s attempt=%s",
+                source,
+                safe_log_value(payload["modulo"], limit=32),
+                safe_log_value(payload["id_lectura"]),
+                attempt,
+            )
+
+        if attempt < TELEMETRY_MAX_RETRIES:
+            sleep_duration = TELEMETRY_BACKOFF_FACTOR ** attempt
+            time.sleep(sleep_duration)
+
+    logger.error(
+        "event=telemetry_forward_exhausted source=%s module=%s reading_id=%s max_retries=%s",
+        source,
+        safe_log_value(payload["modulo"], limit=32),
+        safe_log_value(payload["id_lectura"]),
+        TELEMETRY_MAX_RETRIES,
+    )
+    return False
+
+
+def telemetry_queue_worker():
+    """Hilo en background consumidor de la cola de telemetria."""
+    logger.info("event=telemetry_worker_started")
+    while not _worker_stop_event.is_set():
+        try:
+            item = telemetry_queue.get(timeout=1.0)
+        except Exception:
+            continue
+
+        try:
+            _send_telemetry_with_retry(item)
+        finally:
+            telemetry_queue.task_done()
+    logger.info("event=telemetry_worker_stopped")
 
 
 def utc_now_iso():
@@ -538,55 +670,7 @@ def on_message(client, userdata, message):
                     safe_log_value(topic, limit=150),
                 )
 
-                try:
-                    response = requests.post(
-                        API_URL,
-                        json=validated_reading,
-                        headers=build_api_headers(),
-                        timeout=5
-                    )
-
-                    if response.status_code in (200, 201):
-                        logger.info(
-                            "event=telemetry_forwarded source=json module=%s "
-                            "reading_id=%s http_status=%s",
-                            safe_log_value(validated_reading["modulo"], limit=32),
-                            safe_log_value(validated_reading["id_lectura"]),
-                            response.status_code,
-                        )
-                    else:
-                        logger.error(
-                            "event=telemetry_forward_failed source=json reason=api_http_error "
-                            "module=%s reading_id=%s http_status=%s",
-                            safe_log_value(validated_reading["modulo"], limit=32),
-                            safe_log_value(validated_reading["id_lectura"]),
-                            response.status_code,
-                        )
-
-                except requests.exceptions.ConnectionError:
-                    logger.error(
-                        "event=telemetry_forward_failed source=json reason=api_connection "
-                        "module=%s reading_id=%s",
-                        safe_log_value(validated_reading["modulo"], limit=32),
-                        safe_log_value(validated_reading["id_lectura"]),
-                    )
-
-                except requests.exceptions.Timeout:
-                    logger.error(
-                        "event=telemetry_forward_failed source=json reason=api_timeout "
-                        "module=%s reading_id=%s",
-                        safe_log_value(validated_reading["modulo"], limit=32),
-                        safe_log_value(validated_reading["id_lectura"]),
-                    )
-
-                except Exception:
-                    logger.exception(
-                        "event=telemetry_forward_failed source=json reason=unexpected_error "
-                        "module=%s reading_id=%s",
-                        safe_log_value(validated_reading["modulo"], limit=32),
-                        safe_log_value(validated_reading["id_lectura"]),
-                    )
-
+                enqueue_telemetry(validated_reading, source="json")
                 return
 
         except json.JSONDecodeError:
@@ -707,60 +791,12 @@ def on_message(client, userdata, message):
                 safe_log_value(topic, limit=150),
             )
 
-            try:
-                response = requests.post(
-                    API_URL,
-                    json=validated_reading,
-                    headers=build_api_headers(),
-                    timeout=5,
-                )
-
-                if response.status_code in (200, 201):
-                    logger.info(
-                        "event=telemetry_forwarded source=legacy module=%s "
-                        "reading_id=%s http_status=%s",
-                        safe_log_value(validated_reading["modulo"], limit=32),
-                        safe_log_value(validated_reading["id_lectura"]),
-                        response.status_code,
-                    )
-
-                    if reading_id in current_readings:
-                        del current_readings[reading_id]
-                        logger.info(
-                            "event=legacy_buffer_entry_removed reading_id=%s reason=forwarded",
-                            safe_log_value(reading_id),
-                        )
-                else:
-                    logger.error(
-                        "event=telemetry_forward_failed source=legacy reason=api_http_error "
-                        "module=%s reading_id=%s http_status=%s",
-                        safe_log_value(validated_reading["modulo"], limit=32),
-                        safe_log_value(validated_reading["id_lectura"]),
-                        response.status_code,
-                    )
-
-            except requests.exceptions.ConnectionError:
-                logger.error(
-                    "event=telemetry_forward_failed source=legacy reason=api_connection "
-                    "module=%s reading_id=%s",
-                    safe_log_value(validated_reading["modulo"], limit=32),
-                    safe_log_value(validated_reading["id_lectura"]),
-                )
-
-            except requests.exceptions.Timeout:
-                logger.error(
-                    "event=telemetry_forward_failed source=legacy reason=api_timeout "
-                    "module=%s reading_id=%s",
-                    safe_log_value(validated_reading["modulo"], limit=32),
-                    safe_log_value(validated_reading["id_lectura"]),
-                )
-
-            except Exception:
-                logger.exception(
-                    "event=telemetry_forward_failed source=legacy reason=unexpected_error "
-                    "module=%s reading_id=%s",
-                    safe_log_value(validated_reading["modulo"], limit=32),
-                    safe_log_value(validated_reading["id_lectura"]),
+            enqueue_telemetry(validated_reading, source="legacy")
+            if reading_id in current_readings:
+                del current_readings[reading_id]
+                logger.info(
+                    "event=legacy_buffer_entry_removed reading_id=%s reason=enqueued",
+                    safe_log_value(reading_id),
                 )
 
         # ✅ MEJORADO: Limpiar lecturas antiguas (> 30 segundos)
@@ -792,6 +828,13 @@ def cleanup_old_readings():
 
 def start():
     set_mqtt_connection_health(False)
+    _worker_stop_event.clear()
+    worker_thread = threading.Thread(
+        target=telemetry_queue_worker,
+        name="TelemetryQueueWorker",
+        daemon=True,
+    )
+    worker_thread.start()
     logger.info(
         "event=service_started component=mqtt_subscriber broker=%s port=%s "
         "topic=%s tls_enabled=%s api_url_configured=%s",
@@ -841,6 +884,7 @@ def start():
 
 def stop():
     set_mqtt_connection_health(False)
+    _worker_stop_event.set()
     logger.info("event=service_stopping component=mqtt_subscriber")
 
 if __name__ == "__main__":

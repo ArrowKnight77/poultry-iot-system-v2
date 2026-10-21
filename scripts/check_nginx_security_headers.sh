@@ -87,7 +87,7 @@ check_https_endpoint() {
   check_header "$header_file" Permissions-Policy \
     "geolocation=(), camera=(), microphone=(), payment=(), usb=()"
   check_header "$header_file" Content-Security-Policy \
-    "object-src 'none'; base-uri 'self'; frame-ancestors 'self'; form-action 'self'; upgrade-insecure-requests"
+    "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' https://cdn.jsdelivr.net; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'; form-action 'self'; upgrade-insecure-requests"
   check_header "$header_file" Server "nginx"
 
   printf 'OK: %s%s HTTP %s\n' "$base_url" "$path" "$status"
