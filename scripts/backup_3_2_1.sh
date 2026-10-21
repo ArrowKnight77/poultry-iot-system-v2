@@ -19,6 +19,7 @@ project_dir="${PROJECT_DIR:-$(cd -- "$script_dir/.." && pwd)}"
 local_dir="${BACKUP_LOCAL_DIR:-/srv/poultry-backups}"
 rclone_remote="${BACKUP_RCLONE_CRYPT_REMOTE:-}"
 lock_file="${BACKUP_LOCK_FILE:-}"
+retention_days="${BACKUP_RETENTION_DAYS:-7}"
 
 [[ -x "$project_dir/scripts/backup_postgres.sh" ]] || \
   fail "backup script is not executable: $project_dir/scripts/backup_postgres.sh"
@@ -61,4 +62,9 @@ rclone copyto \
   "$offsite_path"
 
 printf 'Encrypted off-site backup created: %s\n' "$offsite_path"
+
+# Depuracion automatica de respaldos locales antiguos (I9)
+printf 'Pruning local backups older than %s days in %s...\n' "$retention_days" "$local_dir"
+find "$local_dir" -maxdepth 1 -type f \( -name "*.sql.gz" -o -name "*.dump" -o -name "*.sql" \) -mtime +"$retention_days" -exec rm -f -- {} +
+
 printf '3-2-1 backup workflow completed successfully.\n'
