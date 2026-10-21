@@ -230,6 +230,11 @@ LIVE_DATA_RATE_LIMIT = "120 per minute"
 HISTORICAL_DATA_RATE_LIMIT = "30 per minute"
 ALERT_QUERY_RATE_LIMIT = "60 per minute"
 PARVADA_QUERY_RATE_LIMIT = "60 per minute"
+SECURITY_EVENTS_INGEST_RATE_LIMIT = os.getenv(
+    "SECURITY_EVENTS_INGEST_RATE_LIMIT",
+    "30 per minute",
+)
+SECURITY_EVENTS_RETENTION_DAYS = int(os.getenv("SECURITY_EVENTS_RETENTION_DAYS", "90"))
 
 def rate_limit_client_key():
     """Contar por cliente real: IP delegada por el dashboard o vista via Nginx."""
@@ -2859,6 +2864,7 @@ def get_security_events():
 
 
 @app.route("/api/security-events/ingest", methods=["POST"])
+@limiter.limit(SECURITY_EVENTS_INGEST_RATE_LIMIT)
 def ingest_security_event():
     """Recibir eventos técnicos desde mqtt_subscriber con llave propia."""
 
@@ -3316,6 +3322,37 @@ def get_parvada(modulo_codigo):
         })
     except Exception as e:
         return internal_error_response()
+
+
+def purge_old_security_events(retention_days=SECURITY_EVENTS_RETENTION_DAYS):
+    """Eliminar eventos de seguridad con antiguedad mayor al periodo de retencion."""
+    if retention_days < 1:
+        raise ValueError("retention_days debe ser mayor a 0")
+
+    cutoff_date = datetime.utcnow() - timedelta(days=retention_days)
+    deleted_count = SecurityEvent.query.filter(
+        SecurityEvent.created_at < cutoff_date
+    ).delete(synchronize_session=False)
+
+    db.session.commit()
+
+    logger.info(
+        "event=security_events_purged retention_days=%s deleted_count=%s cutoff=%s",
+        retention_days,
+        deleted_count,
+        cutoff_date.isoformat(),
+    )
+    return deleted_count
+
+
+@app.cli.command("purge-security-events")
+def purge_security_events_command():
+    """Comando CLI para depurar registros antiguos de auditoria y eventos de seguridad."""
+    try:
+        deleted = purge_old_security_events(retention_days=SECURITY_EVENTS_RETENTION_DAYS)
+        print(f"Depuracion completada: {deleted} eventos anteriores a {SECURITY_EVENTS_RETENTION_DAYS} dias eliminados.")
+    except Exception as e:
+        print(f"Error durante la depuracion de eventos: {e}")
 
 
 def start(port=5000, host='0.0.0.0'):
