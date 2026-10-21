@@ -13,7 +13,7 @@ EXPECTED_ADD_HEADERS = (
     'add_header X-XSS-Protection "0" always;',
     'add_header Referrer-Policy "strict-origin-when-cross-origin" always;',
     'add_header Permissions-Policy "geolocation=(), camera=(), microphone=(), payment=(), usb=()" always;',
-    "add_header Content-Security-Policy \"object-src 'none'; base-uri 'self'; frame-ancestors 'self'; form-action 'self'; upgrade-insecure-requests\" always;",
+    "add_header Content-Security-Policy \"default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' https://cdn.jsdelivr.net; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'; form-action 'self'; upgrade-insecure-requests\" always;",
 )
 
 MANAGED_HEADERS = (
