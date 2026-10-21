@@ -3386,7 +3386,7 @@ def purge_security_events_command():
         print(f"Error durante la depuracion de eventos: {e}")
 
 
-def start(port=5000, host='0.0.0.0'):
+def start(port=5000, host='127.0.0.1'):
     debug_mode = os.getenv("FLASK_ENV", "production").lower() == "development"
     app.run(debug=debug_mode, port=port, host=host, use_reloader=False)
 

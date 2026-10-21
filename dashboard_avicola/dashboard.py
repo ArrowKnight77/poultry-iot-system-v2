@@ -1301,7 +1301,7 @@ def reports():
     )
 
 # En dashboard_avicola.py, modifica la función start:
-def start(port=5001, host='0.0.0.0'):
+def start(port=5001, host='127.0.0.1'):
     if not os.path.exists('templates'):
         os.makedirs('templates')
     debug_mode = os.getenv("FLASK_ENV", "development").lower() == "development"

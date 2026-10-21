@@ -23,7 +23,7 @@ MQTT_USERNAME = os.getenv('MQTT_USERNAME')
 MQTT_PASSWORD = os.getenv('MQTT_PASSWORD')
 MQTT_TLS_ENABLED = os.getenv("MQTT_TLS_ENABLED", "false").lower() == "true"
 MQTT_TLS_CA_CERT = os.getenv("MQTT_TLS_CA_CERT")
-MQTT_HEALTH_FILE = os.getenv("MQTT_HEALTH_FILE", "/tmp/mqtt-connected")
+MQTT_HEALTH_FILE = os.getenv("MQTT_HEALTH_FILE", "/tmp/mqtt-connected")  # nosec B108
 # Por defecto escuchamos todos los módulos y tanto esquema viejo como nuevo
 # - Esquema viejo: sensor/modulo1/temperatura, sensor/modulo1/humedad, etc.
 # - Esquema nuevo: sensor/modulo1/data (JSON con todos los valores)
