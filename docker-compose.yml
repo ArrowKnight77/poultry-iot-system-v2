@@ -28,7 +28,6 @@ services:
     networks:
       - avicola-network
     ports:
-      - "127.0.0.1:1883:1883"
       - "127.0.0.1:8883:8883"
     volumes:
       - ./mosquitto/config:/mosquitto/config:ro
