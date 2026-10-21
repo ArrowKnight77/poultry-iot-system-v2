@@ -1,3 +1,4 @@
+from werkzeug.exceptions import HTTPException
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import select, text
@@ -107,6 +108,12 @@ def internal_error_response(message="Error interno del servidor."):
 
 
 app = Flask(__name__)
+ALLOWED_UMBRAL_VARIABLES = {
+    'temperatura', 'humedad', 'co2', 'amoniaco', 'luz',
+    'presion', 'nivel_agua', 'consumo_alimento'
+}
+ALLOWED_ALERT_STATES = {'active', 'acknowledged', 'resolved'}
+
 
 # Nginx es el unico proxy de confianza delante de la API. Con x_for=1 se toma
 # solo el ultimo valor de X-Forwarded-For, que es el que escribe Nginx.
@@ -2427,6 +2434,11 @@ def update_umbrales():
                     'error': 'La variable del umbral es requerida.'
                 }), 400
 
+            if variable not in ALLOWED_UMBRAL_VARIABLES:
+                return jsonify({
+                    'error': f"Variable de umbral no permitida. Valores permitidos: {', '.join(sorted(ALLOWED_UMBRAL_VARIABLES))}"
+                }), 400
+
             if not (valor_medio < valor_alto < valor_grave):
                 return jsonify({
                     'error': (
@@ -2682,7 +2694,12 @@ def update_alert(alert_id):
         changed_fields = []
 
         if 'estado' in data:
-            alert.estado = data['estado']
+            nuevo_estado = str(data['estado']).strip()
+            if nuevo_estado not in ALLOWED_ALERT_STATES:
+                return jsonify({
+                    'error': f"Estado inválido. Valores permitidos: {', '.join(sorted(ALLOWED_ALERT_STATES))}"
+                }), 400
+            alert.estado = nuevo_estado
             changed_fields.append('estado')
 
             if data['estado'] == 'resolved':
@@ -2978,6 +2995,8 @@ def create_granja():
             'nombre': granja.nombre
         }), 201
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3015,6 +3034,8 @@ def update_granja(granja_id):
 
         return jsonify({'msg': 'Granja actualizada'})
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3043,6 +3064,8 @@ def delete_granja(granja_id):
 
         return jsonify({'msg': 'Granja eliminada'})
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3124,6 +3147,8 @@ def create_nave():
             'nombre': nave.nombre
         }), 201
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3172,6 +3197,8 @@ def update_nave(nave_id):
 
         return jsonify({'msg': 'Nave actualizada'})
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3203,6 +3230,8 @@ def delete_nave(nave_id):
 
         return jsonify({'msg': 'Nave eliminada'})
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
@@ -3291,6 +3320,8 @@ def update_modulo(codigo):
             'codigo': codigo
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.session.rollback()
         return internal_error_response()
